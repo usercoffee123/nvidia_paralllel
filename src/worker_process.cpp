@@ -50,7 +50,7 @@ namespace
 class WorkerProcessImpl
 {
 public:
-    WorkerProcessImpl(const std::string &pythonExe, const std::string &scriptPath, std::size_t qrcLayers);
+    WorkerProcessImpl(const std::string &pythonExe, const std::string &scriptPath, std::size_t qrcLayers, std::size_t nJobs);
     ~WorkerProcessImpl();
 
     WorkerProcessImpl(const WorkerProcessImpl &) = delete;
@@ -67,7 +67,7 @@ private:
     int childOutFd_{-1};
 };
 
-WorkerProcessImpl::WorkerProcessImpl(const std::string &pythonExe, const std::string &scriptPath, std::size_t qrcLayers)
+WorkerProcessImpl::WorkerProcessImpl(const std::string &pythonExe, const std::string &scriptPath, std::size_t qrcLayers, std::size_t nJobs)
 {
     signal(SIGPIPE, SIG_IGN);
 
@@ -75,6 +75,8 @@ WorkerProcessImpl::WorkerProcessImpl(const std::string &pythonExe, const std::st
     validate_worker_path(scriptPath, "Worker script");
     if (qrcLayers == 0)
         throw std::invalid_argument("qrc-layers must be > 0.");
+    if (nJobs == 0)
+        throw std::invalid_argument("n-jobs must be > 0.");
 
     int toChild[2], fromChild[2];
     if (pipe(toChild) != 0 || pipe(fromChild) != 0)
@@ -98,11 +100,14 @@ WorkerProcessImpl::WorkerProcessImpl(const std::string &pythonExe, const std::st
             close(fd);
 
         const std::string layersArg = std::to_string(qrcLayers);
+        const std::string jobsArg = std::to_string(nJobs);
         char *argv[] = {
             const_cast<char *>(pythonExe.c_str()),
             const_cast<char *>(scriptPath.c_str()),
             const_cast<char *>("--qrc-layers"),
             const_cast<char *>(layersArg.c_str()),
+            const_cast<char *>("--n-jobs"),
+            const_cast<char *>(jobsArg.c_str()),
             nullptr};
 
         if (pythonExe.find('/') != std::string::npos)
@@ -238,19 +243,22 @@ std::vector<double> Worker::operator()(std::size_t taskId, const DataView &input
     static thread_local std::string activePythonExe;
     static thread_local std::string activeScriptPath;
     static thread_local std::size_t activeQrcLayers = 0;
+    static thread_local std::size_t activeNJobs = 0;
 
     // Rebuild the worker process whenever its configuration changes.
     const bool configChanged =
         (activePythonExe != pythonExe) ||
         (activeScriptPath != scriptPath) ||
-        (activeQrcLayers != qrcLayers);
+        (activeQrcLayers != qrcLayers) ||
+        (activeNJobs != nJobs);
 
     if (!impl || configChanged)
     {
-        impl = std::make_unique<WorkerProcessImpl>(pythonExe, scriptPath, qrcLayers);
+        impl = std::make_unique<WorkerProcessImpl>(pythonExe, scriptPath, qrcLayers, nJobs);
         activePythonExe = pythonExe;
         activeScriptPath = scriptPath;
         activeQrcLayers = qrcLayers;
+        activeNJobs = nJobs;
     }
 
     return impl->process_chunk(taskId, input, resultCols);

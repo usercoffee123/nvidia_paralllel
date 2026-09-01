@@ -12,11 +12,14 @@
 #include "dataset.h"
 
 // Lightweight function object that processes one chunk via a Python subprocess.
+// The Python worker owns the row-level parallelism (via joblib); nJobs selects
+// how many parallel jobs it may use.
 struct Worker
 {
     std::string pythonExe;
     std::string scriptPath;
     std::size_t qrcLayers = 2;
+    std::size_t nJobs = 1;
 
     // Processes one chunk and writes output column count into resultCols.
     std::vector<double> operator()(std::size_t taskId, const DataView &input, std::size_t &resultCols) const;

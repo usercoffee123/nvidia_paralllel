@@ -84,25 +84,27 @@ void fill_random(Dataset &ds)
             ds.at(r, c) = dist(rng);
 }
 
-// Runs the worker benchmark across multiple process counts.
+// Runs the worker benchmark, sending the whole dataset in one task while
+// sweeping the number of joblib jobs the Python worker may use.
 void run_benchmark(const Args &args, const Dataset &ds)
 {
-    const Worker worker{args.pythonExe, args.script, args.qrcLayers};
     const DataView view{ds.data(), ds.rows(), ds.cols()};
-    const std::array<std::size_t, 5> workerCounts{1, 2, 4, 8, 16};
+    const std::array<std::size_t, 5> jobCounts{1, 2, 4, 8, 16};
 
-    std::cout << "\nRuntime by parallel process count:\n";
+    std::cout << "\nRuntime by joblib job count:\n";
 
-    for (const std::size_t requestedWorkers : workerCounts)
+    for (const std::size_t requestedJobs : jobCounts)
     {
+        const Worker worker{args.pythonExe, args.script, args.qrcLayers, requestedJobs};
+        std::size_t resultCols = 0;
+
         const auto t0 = std::chrono::steady_clock::now();
-        const auto output = parallel_map(worker, view, requestedWorkers);
+        const auto output = worker(0, view, resultCols);
         const auto t1 = std::chrono::steady_clock::now();
         const double seconds = std::chrono::duration<double>(t1 - t0).count();
         (void)output;
 
-        // The number of workers actually used is no longer displayed.
-        std::cout << requestedWorkers << "\t" << seconds << "\n";
+        std::cout << requestedJobs << "\t" << seconds << "\n";
     }
 }
 

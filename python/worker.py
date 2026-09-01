@@ -18,6 +18,7 @@ import struct
 import sys
 
 import numpy as np
+from joblib import Parallel, delayed
 from qiskit import QuantumCircuit
 from qiskit_aer import AerSimulator
 
@@ -128,16 +129,27 @@ def process_row(simulator, values, start: int, cols: int, qubits: int, layers: i
     return compute_z_expectations(counts, qubits, shots)
 
 
+def process_batch(values, begin_row: int, end_row: int, cols: int, qubits: int, layers: int, reservoir, shots: int):
+    """Process a contiguous block of rows and return their flattened Z expectations.
+
+    Runs inside a joblib worker process, so it builds its own simulator (the
+    fixed seed keeps results deterministic regardless of how rows are sharded).
+    """
+    simulator = AerSimulator(method="statevector", max_parallel_threads=1, seed_simulator=QRC_SEED)
+    out = []
+    for row in range(begin_row, end_row):
+        out.extend(process_row(simulator, values, row * cols, cols, qubits, layers, reservoir, shots))
+    return out
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--qrc-layers", type=int, default=2)
+    parser.add_argument("--n-jobs", type=int, default=1)
     args, _ = parser.parse_known_args()
 
-    if args.qrc_layers < 1:
+    if args.qrc_layers < 1 or args.n_jobs < 1:
         return 1
-
-    # Create simulator with fixed seed for reproducible measurements
-    simulator = AerSimulator(method="statevector", max_parallel_threads=1, seed_simulator=42)
 
     stdin = sys.stdin.buffer
     stdout = sys.stdout.buffer
@@ -185,14 +197,18 @@ def main() -> int:
             vals.byteswap()
 
         reservoir = build_reservoir_params(qubits, args.qrc_layers, QRC_SEED)
-        expectations = []
-        offset = 0
         shots = 1000
-        for _ in range(rows):
-            expectations.extend(
-                process_row(simulator, vals, offset, cols, qubits, args.qrc_layers, reservoir, shots)
+
+        # Shard rows into contiguous batches and run them across joblib workers.
+        n_jobs = min(args.n_jobs, rows)
+        bounds = [(rows * i) // n_jobs for i in range(n_jobs + 1)]
+        batches = Parallel(n_jobs=n_jobs)(
+            delayed(process_batch)(
+                vals, bounds[i], bounds[i + 1], cols, qubits, args.qrc_layers, reservoir, shots
             )
-            offset += cols
+            for i in range(n_jobs)
+        )
+        expectations = [value for batch in batches for value in batch]
 
         result_header = struct.pack(HEADER_FMT, MAGIC, VERSION, MSG_RESULT, task_id, rows, qubits)
         out = array("d", expectations)
