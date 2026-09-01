@@ -32,6 +32,10 @@ MSG_QUIT = 2
 MSG_RESULT = 3
 MSG_ERROR = 4
 
+MAX_ROWS = 1_000_000
+MAX_COLS = 1_000_000
+MAX_TOTAL_VALUES = 67_108_864  # ~536 MiB of doubles for a single task
+
 HEADER_FMT = "<IHHQQQ"
 HEADER_SIZE = struct.calcsize(HEADER_FMT)
 QRC_SEED = 42
@@ -127,8 +131,6 @@ def process_row(simulator, values, start: int, cols: int, qubits: int, layers: i
 def main() -> int:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--qrc-layers", type=int, default=2)
-    parser.add_argument("--shots", type=int, default=65536,
-                        help="Number of shots for Aer simulator measurements")
     args, _ = parser.parse_known_args()
 
     if args.qrc_layers < 1:
@@ -159,15 +161,22 @@ def main() -> int:
 
         cols = cols_or_aux
         qubits = int(cols)
-        if qubits <= 0:
-            send_error(stdout, task_id, "cols must be > 0")
+        if rows == 0 or qubits <= 0:
+            send_error(stdout, task_id, "rows and cols must be > 0")
+            return 1
+        if rows > MAX_ROWS or qubits > MAX_COLS:
+            send_error(stdout, task_id, "rows or cols out of range")
             return 1
 
-        total_values = rows * cols
+        total_values = rows * qubits
+        if total_values > MAX_TOTAL_VALUES:
+            send_error(stdout, task_id, "task payload is too large")
+            return 1
+
         payload_nbytes = total_values * 8
 
         payload = read_exact(stdin, payload_nbytes)
-        if not payload:
+        if len(payload) != payload_nbytes:
             return 1
 
         vals = array("d")
@@ -178,9 +187,10 @@ def main() -> int:
         reservoir = build_reservoir_params(qubits, args.qrc_layers, QRC_SEED)
         expectations = []
         offset = 0
+        shots = 1000
         for _ in range(rows):
             expectations.extend(
-                process_row(simulator, vals, offset, cols, qubits, args.qrc_layers, reservoir, args.shots)
+                process_row(simulator, vals, offset, cols, qubits, args.qrc_layers, reservoir, shots)
             )
             offset += cols
 

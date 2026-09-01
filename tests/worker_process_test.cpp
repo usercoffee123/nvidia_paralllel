@@ -4,9 +4,13 @@
 #include "worker_process.h"
 #include "dataset.h"
 
+#ifndef WORKER_PYTHON_PATH
+#define WORKER_PYTHON_PATH "python3"
+#endif
+
 static Worker make_worker()
 {
-    return Worker{"python3", WORKER_SCRIPT_PATH};
+    return Worker{WORKER_PYTHON_PATH, WORKER_SCRIPT_PATH};
 }
 
 // ---------------------------------------------------------------------------
@@ -58,6 +62,22 @@ TEST_CASE("Worker handles single row", "[worker]")
     auto results = worker(0, DataView{ds.data(), 1, cols}, resultCols);
 
     REQUIRE(results.size() == resultCols);
+}
+
+TEST_CASE("Worker rejects empty executable or script path", "[worker]")
+{
+    constexpr std::size_t rows = 2, cols = 3;
+    Dataset ds(rows, cols);
+    for (std::size_t i = 0; i < rows * cols; ++i)
+        ds.data()[i] = static_cast<double>(i) * 0.1;
+
+    std::size_t resultCols = 0;
+
+    Worker badPython{"", WORKER_SCRIPT_PATH};
+    REQUIRE_THROWS_AS(badPython(0, DataView{ds.data(), rows, cols}, resultCols), std::invalid_argument);
+
+    Worker badScript{"python3", ""};
+    REQUIRE_THROWS_AS(badScript(0, DataView{ds.data(), rows, cols}, resultCols), std::invalid_argument);
 }
 
 TEST_CASE("Worker is deterministic", "[worker]")

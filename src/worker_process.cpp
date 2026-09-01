@@ -1,26 +1,56 @@
 #include "worker_process.h"
 
 #include <cerrno>
+#include <csignal>
 #include <cstdint>
-#include <cstring>
-#include <future>
-#include <limits>
 #include <stdexcept>
+#include <sys/stat.h>
 #include <sys/types.h>
-#include <sys/wait.h>
 #include <unistd.h>
-
-#ifdef __linux__
-#include <sched.h>
-#endif
+#include <vector>
 
 #include "protocol.h"
 
-// Internal: stateful worker process manager
+namespace
+{
+    constexpr std::size_t kMaxValuesPerTask = 1ULL << 26; // 67,108,864 doubles (~536 MiB payload)
+
+    void close_pipe_pair(int (&fds)[2])
+    {
+        close(fds[0]);
+        close(fds[1]);
+    }
+
+    void validate_worker_path(const std::string &path, const char *what)
+    {
+        if (path.empty())
+            throw std::invalid_argument(std::string(what) + " must not be empty.");
+
+        if (path.find('/') == std::string::npos && path.find('~') != 0)
+            return;
+
+        struct stat st{};
+        if (stat(path.c_str(), &st) != 0)
+            throw std::invalid_argument(std::string(what) + " does not exist: " + path);
+        if (!S_ISREG(st.st_mode))
+            throw std::invalid_argument(std::string(what) + " is not a regular file: " + path);
+    }
+
+    std::size_t checked_size_product(std::size_t a, std::size_t b)
+    {
+        if (a == 0 || b == 0)
+            return 0;
+        if (a > kMaxValuesPerTask / b)
+            throw std::invalid_argument("Task payload is too large.");
+        return a * b;
+    }
+} // namespace
+
+// CPU pinning support removed; no platform-specific scheduler headers needed.
 class WorkerProcessImpl
 {
 public:
-    WorkerProcessImpl(const std::string &pythonExe, const std::string &scriptPath, int cpuToPin);
+    WorkerProcessImpl(const std::string &pythonExe, const std::string &scriptPath, std::size_t qrcLayers);
     ~WorkerProcessImpl();
 
     WorkerProcessImpl(const WorkerProcessImpl &) = delete;
@@ -37,15 +67,16 @@ private:
     int childOutFd_{-1};
 };
 
-WorkerProcessImpl::WorkerProcessImpl(const std::string &pythonExe, const std::string &scriptPath, int cpuToPin)
+WorkerProcessImpl::WorkerProcessImpl(const std::string &pythonExe, const std::string &scriptPath, std::size_t qrcLayers)
 {
-    int toChild[2], fromChild[2];
-    const auto close_pipe_pair = [](int (&fds)[2])
-    {
-        close(fds[0]);
-        close(fds[1]);
-    };
+    signal(SIGPIPE, SIG_IGN);
 
+    validate_worker_path(pythonExe, "Python executable");
+    validate_worker_path(scriptPath, "Worker script");
+    if (qrcLayers == 0)
+        throw std::invalid_argument("qrc-layers must be > 0.");
+
+    int toChild[2], fromChild[2];
     if (pipe(toChild) != 0 || pipe(fromChild) != 0)
     {
         throw std::runtime_error("Failed to create pipes for worker process.");
@@ -61,33 +92,23 @@ WorkerProcessImpl::WorkerProcessImpl(const std::string &pythonExe, const std::st
 
     if (childPid_ == 0)
     {
-#ifdef __linux__
-        if (cpuToPin >= 0)
-        {
-            const long cpuCount = sysconf(_SC_NPROCESSORS_ONLN);
-            if (cpuCount <= 0)
-            {
-                _exit(126);
-            }
-
-            cpu_set_t cpuset;
-            CPU_ZERO(&cpuset);
-            CPU_SET(static_cast<int>(cpuToPin % static_cast<int>(cpuCount)), &cpuset);
-
-            if (sched_setaffinity(0, sizeof(cpuset), &cpuset) != 0)
-            {
-                _exit(126);
-            }
-        }
-#else
-        (void)cpuToPin;
-#endif
-
         dup2(toChild[0], STDIN_FILENO);
         dup2(fromChild[1], STDOUT_FILENO);
         for (int fd : {toChild[0], toChild[1], fromChild[0], fromChild[1]})
             close(fd);
-        execlp(pythonExe.c_str(), pythonExe.c_str(), scriptPath.c_str(), static_cast<char *>(nullptr));
+
+        const std::string layersArg = std::to_string(qrcLayers);
+        char *argv[] = {
+            const_cast<char *>(pythonExe.c_str()),
+            const_cast<char *>(scriptPath.c_str()),
+            const_cast<char *>("--qrc-layers"),
+            const_cast<char *>(layersArg.c_str()),
+            nullptr};
+
+        if (pythonExe.find('/') != std::string::npos)
+            execv(pythonExe.c_str(), argv);
+        else
+            execvp(pythonExe.c_str(), argv);
         _exit(127);
     }
 
@@ -117,36 +138,58 @@ WorkerProcessImpl::~WorkerProcessImpl()
 
 bool WorkerProcessImpl::write_exact(const void *buf, std::size_t len)
 {
+    if (len == 0)
+        return true;
+
     const auto *p = static_cast<const char *>(buf);
     std::size_t written = 0;
     while (written < len)
     {
         const ssize_t n = write(childInFd_, p + written, len - written);
-        if (n < 0 && errno != EINTR)
+        if (n < 0)
+        {
+            if (errno == EINTR)
+                continue;
             return false;
-        if (n > 0)
-            written += static_cast<std::size_t>(n);
+        }
+        if (n == 0)
+            return false;
+        written += static_cast<std::size_t>(n);
     }
     return true;
 }
 
 bool WorkerProcessImpl::read_exact(void *buf, std::size_t len)
 {
+    if (len == 0)
+        return true;
+
     auto *p = static_cast<char *>(buf);
     std::size_t got = 0;
     while (got < len)
     {
         const ssize_t n = read(childOutFd_, p + got, len - got);
-        if (n < 0 && errno != EINTR)
+        if (n < 0)
+        {
+            if (errno == EINTR)
+                continue;
             return false;
-        if (n > 0)
-            got += static_cast<std::size_t>(n);
+        }
+        if (n == 0)
+            return false;
+        got += static_cast<std::size_t>(n);
     }
     return true;
 }
 
 std::vector<double> WorkerProcessImpl::process_chunk(std::size_t taskId, const DataView &input, std::size_t &resultCols)
 {
+    if (input.data == nullptr && (input.rows != 0 || input.cols != 0))
+        throw std::invalid_argument("Input data pointer is null for a non-empty task.");
+    if (input.rows == 0 || input.cols == 0)
+        throw std::invalid_argument("Task rows and cols must be > 0.");
+
+    const std::size_t total = checked_size_product(input.rows, input.cols);
     const MessageHeader req{static_cast<uint32_t>(Protocol::Magic), kVersion,
                             static_cast<uint16_t>(MessageType::Task),
                             static_cast<uint64_t>(taskId),
@@ -155,7 +198,6 @@ std::vector<double> WorkerProcessImpl::process_chunk(std::size_t taskId, const D
     if (!write_exact(&req, sizeof(req)))
         throw std::runtime_error("Failed to write task header to worker.");
 
-    const std::size_t total = input.rows * input.cols;
     if (total > 0 && !write_exact(input.data, total * sizeof(double)))
         throw std::runtime_error("Failed to write task payload to worker.");
 
@@ -178,7 +220,10 @@ std::vector<double> WorkerProcessImpl::process_chunk(std::size_t taskId, const D
         throw std::runtime_error("Unexpected message type from worker.");
 
     resultCols = resp.cols;
-    const std::size_t nValues = resp.rows * resultCols;
+    if (resultCols == 0)
+        throw std::runtime_error("Worker returned zero output columns.");
+
+    const std::size_t nValues = checked_size_product(resp.rows, resultCols);
     std::vector<double> results(nValues);
     if (nValues > 0 && !read_exact(results.data(), nValues * sizeof(double)))
         throw std::runtime_error("Failed to read results from worker.");
@@ -192,39 +237,20 @@ std::vector<double> Worker::operator()(std::size_t taskId, const DataView &input
     static thread_local std::unique_ptr<WorkerProcessImpl> impl;
     static thread_local std::string activePythonExe;
     static thread_local std::string activeScriptPath;
-    static thread_local bool activePinWorkersToSingleCpu = false;
-    static thread_local std::size_t activeCpuStart = 0;
-    static thread_local std::size_t activeCpuStride = 1;
-    static thread_local int activeCpuToPin = -1;
+    static thread_local std::size_t activeQrcLayers = 0;
 
-    int desiredCpuToPin = -1;
-    if (pinWorkersToSingleCpu)
-    {
-        const std::size_t candidate = cpuStart + taskId * cpuStride;
-        if (candidate > static_cast<std::size_t>(std::numeric_limits<int>::max()))
-        {
-            throw std::runtime_error("Requested CPU index exceeds supported range.");
-        }
-        desiredCpuToPin = static_cast<int>(candidate);
-    }
-
+    // Rebuild the worker process whenever its configuration changes.
     const bool configChanged =
         (activePythonExe != pythonExe) ||
         (activeScriptPath != scriptPath) ||
-        (activePinWorkersToSingleCpu != pinWorkersToSingleCpu) ||
-        (activeCpuStart != cpuStart) ||
-        (activeCpuStride != cpuStride) ||
-        (activeCpuToPin != desiredCpuToPin);
+        (activeQrcLayers != qrcLayers);
 
     if (!impl || configChanged)
     {
-        impl = std::make_unique<WorkerProcessImpl>(pythonExe, scriptPath, desiredCpuToPin);
+        impl = std::make_unique<WorkerProcessImpl>(pythonExe, scriptPath, qrcLayers);
         activePythonExe = pythonExe;
         activeScriptPath = scriptPath;
-        activePinWorkersToSingleCpu = pinWorkersToSingleCpu;
-        activeCpuStart = cpuStart;
-        activeCpuStride = cpuStride;
-        activeCpuToPin = desiredCpuToPin;
+        activeQrcLayers = qrcLayers;
     }
 
     return impl->process_chunk(taskId, input, resultCols);

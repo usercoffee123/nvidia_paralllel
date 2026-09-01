@@ -16,16 +16,18 @@
 #define WORKER_SCRIPT_PATH "python/worker.py"
 #endif
 
+#ifndef WORKER_PYTHON_PATH
+#define WORKER_PYTHON_PATH "python3"
+#endif
+
 // Runtime options for the benchmark utility.
 struct Args
 {
     std::size_t rows = 100000;
     std::size_t cols = 6;
-    std::string pythonExe = "python3";
+    std::string pythonExe = WORKER_PYTHON_PATH;
     std::string script = WORKER_SCRIPT_PATH;
-    bool pinWorkersToSingleCpu = false;
-    std::size_t cpuStart = 0;
-    std::size_t cpuStride = 1;
+    std::size_t qrcLayers = 2;
 };
 
 // Prints command-line usage.
@@ -34,9 +36,7 @@ void print_usage()
     std::cout
         << "Usage: parallel_python [--rows N] [--cols N] [--python PATH] [--worker-script PATH] [options]\n"
         << "Options:\n"
-        << "  --pin-workers-single-cpu   Pin each worker process to one Linux CPU (disabled by default).\n"
-        << "  --cpu-start N              Base CPU index for worker 0 when pinning (default: 0).\n"
-        << "  --cpu-stride N             CPU step between workers when pinning (default: 1).\n";
+        << "  --qrc-layers N   Number of quantum reservoir layers per circuit (default: 2).\n";
 }
 
 // Parses command-line arguments into Args.
@@ -62,17 +62,15 @@ Args parse_args(int argc, char **argv)
             args.pythonExe = argv[++i];
         else if (a == "--worker-script")
             args.script = argv[++i];
-        else if (a == "--pin-workers-single-cpu")
-            args.pinWorkersToSingleCpu = true;
-        else if (a == "--cpu-start")
-            args.cpuStart = std::stoull(argv[++i]);
-        else if (a == "--cpu-stride")
-            args.cpuStride = std::stoull(argv[++i]);
+        else if (a == "--qrc-layers")
+            args.qrcLayers = std::stoull(argv[++i]);
         else
             throw std::runtime_error("Unknown argument: " + std::string(a));
     }
-    if (args.rows == 0 || args.cols == 0 || args.cpuStride == 0)
-        throw std::runtime_error("rows, cols, and cpu-stride must be > 0.");
+    if (args.rows == 0 || args.cols == 0)
+        throw std::runtime_error("rows and cols must be > 0.");
+    if (args.qrcLayers == 0)
+        throw std::runtime_error("qrc-layers must be > 0.");
     return args;
 }
 
@@ -89,12 +87,11 @@ void fill_random(Dataset &ds)
 // Runs the worker benchmark across multiple process counts.
 void run_benchmark(const Args &args, const Dataset &ds)
 {
-    const Worker worker{args.pythonExe, args.script, args.pinWorkersToSingleCpu, args.cpuStart, args.cpuStride};
+    const Worker worker{args.pythonExe, args.script, args.qrcLayers};
     const DataView view{ds.data(), ds.rows(), ds.cols()};
     const std::array<std::size_t, 5> workerCounts{1, 2, 4, 8, 16};
 
-    std::cout << "\nRuntime by parallel process count:\n"
-              << "  workers(requested)  workers(used)  time(s)\n";
+    std::cout << "\nRuntime by parallel process count:\n";
 
     for (const std::size_t requestedWorkers : workerCounts)
     {
@@ -104,10 +101,8 @@ void run_benchmark(const Args &args, const Dataset &ds)
         const double seconds = std::chrono::duration<double>(t1 - t0).count();
         (void)output;
 
-        const std::size_t usedWorkers = std::min(requestedWorkers, ds.rows());
-        std::cout << "  " << std::setw(18) << requestedWorkers
-                  << std::setw(15) << usedWorkers
-                  << std::setw(10) << std::fixed << std::setprecision(6) << seconds << "\n";
+        // The number of workers actually used is no longer displayed.
+        std::cout << requestedWorkers << "\t" << seconds << "\n";
     }
 }
 
