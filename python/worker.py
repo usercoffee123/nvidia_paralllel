@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Quantum reservoir computing worker using Qiskit Aer simulator."""
+"""Quantum reservoir computing benchmark using Qiskit Aer + joblib."""
 import os
 
 # Pin all threading to 1 — must be set BEFORE importing numpy/qiskit so that
@@ -12,53 +12,15 @@ os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
 os.environ["NUMEXPR_NUM_THREADS"] = "1"
 
 import argparse
-from array import array
 import math
-import struct
-import sys
+import time
 
 import numpy as np
 from joblib import Parallel, delayed
 from qiskit import QuantumCircuit
 from qiskit_aer import AerSimulator
 
-# Seed for reproducibility
-np.random.seed(42)
-
-MAGIC = 0x50595043  # "CPYP"
-VERSION = 1
-
-MSG_TASK = 1
-MSG_QUIT = 2
-MSG_RESULT = 3
-MSG_ERROR = 4
-
-MAX_ROWS = 1_000_000
-MAX_COLS = 1_000_000
-MAX_TOTAL_VALUES = 67_108_864  # ~536 MiB of doubles for a single task
-
-HEADER_FMT = "<IHHQQQ"
-HEADER_SIZE = struct.calcsize(HEADER_FMT)
 QRC_SEED = 42
-
-
-def read_exact(stream, nbytes: int) -> bytes:
-    chunks = bytearray()
-    while len(chunks) < nbytes:
-        part = stream.read(nbytes - len(chunks))
-        if not part:
-            return b""
-        chunks.extend(part)
-    return bytes(chunks)
-
-
-def send_error(stdout, task_id: int, message: str) -> None:
-    payload = message.encode("utf-8")
-    header = struct.pack(HEADER_FMT, MAGIC, VERSION, MSG_ERROR, task_id, 0, len(payload))
-    stdout.write(header)
-    if payload:
-        stdout.write(payload)
-    stdout.flush()
 
 
 def build_reservoir_params(qubits: int, layers: int, seed: int):
@@ -75,13 +37,12 @@ def build_reservoir_params(qubits: int, layers: int, seed: int):
     return params
 
 
-def build_circuit(values, start: int, cols: int, qubits: int, layers: int, reservoir):
+def build_circuit(row_values, qubits: int, layers: int, reservoir):
     """Construct a Qiskit QuantumCircuit for one row of data."""
     qc = QuantumCircuit(qubits, qubits)
 
     def feature_angle(index: int) -> float:
-        v = values[start + (index % cols)]
-        return math.pi * math.tanh(v)
+        return math.pi * math.tanh(row_values[index % qubits])
 
     # Feature encoding: RY + RZ on each qubit
     for q in range(qubits):
@@ -121,15 +82,7 @@ def compute_z_expectations(counts, qubits: int, shots: int):
     return [e / shots for e in expectations]
 
 
-def process_row(simulator, values, start: int, cols: int, qubits: int, layers: int, reservoir, shots: int):
-    """Run one row through the quantum reservoir and return Z expectations."""
-    qc = build_circuit(values, start, cols, qubits, layers, reservoir)
-    result = simulator.run(qc, shots=shots).result()
-    counts = result.get_counts()
-    return compute_z_expectations(counts, qubits, shots)
-
-
-def process_batch(chunk, n_rows: int, cols: int, qubits: int, layers: int, reservoir, shots: int):
+def process_batch(chunk, qubits: int, layers: int, reservoir, shots: int):
     """Process one shard of rows and return their flattened Z expectations.
 
     Runs inside a joblib worker process. It receives only its own slice of the
@@ -138,112 +91,57 @@ def process_batch(chunk, n_rows: int, cols: int, qubits: int, layers: int, reser
     """
     simulator = AerSimulator(method="statevector", max_parallel_threads=1, seed_simulator=QRC_SEED)
     out = []
-    for row in range(n_rows):
-        out.extend(process_row(simulator, chunk, row * cols, cols, qubits, layers, reservoir, shots))
+    for row in chunk:
+        qc = build_circuit(row, qubits, layers, reservoir)
+        counts = simulator.run(qc, shots=shots).result().get_counts()
+        out.extend(compute_z_expectations(counts, qubits, shots))
     return out
 
 
-def run_reservoir(values, rows: int, cols: int, qubits: int, layers: int, reservoir, shots: int, n_jobs: int):
-    """Shard rows across joblib worker processes and return flattened Z expectations.
+def run_reservoir(data, qubits: int, layers: int, reservoir, shots: int, n_jobs: int):
+    """Shard rows across n_jobs joblib workers and return flattened Z expectations.
 
     Each shard is pickled with only its own slice of the data so a worker never
     holds the whole dataset. joblib preserves dispatch order, so concatenating
     the returned batches yields row-major output.
     """
+    rows = len(data)
     n_jobs = max(1, min(n_jobs, rows))
     bounds = [(rows * i) // n_jobs for i in range(n_jobs + 1)]
     batches = Parallel(n_jobs=n_jobs, backend="loky")(
-        delayed(process_batch)(
-            values[bounds[i] * cols:bounds[i + 1] * cols],
-            bounds[i + 1] - bounds[i],
-            cols,
-            qubits,
-            layers,
-            reservoir,
-            shots,
-        )
+        delayed(process_batch)(data[bounds[i]:bounds[i + 1]], qubits, layers, reservoir, shots)
         for i in range(n_jobs)
     )
     return [value for batch in batches for value in batch]
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(add_help=False)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--rows", type=int, default=3000)
+    parser.add_argument("--cols", type=int, default=6)
     parser.add_argument("--qrc-layers", type=int, default=2)
-    parser.add_argument("--n-jobs", type=int, default=1)
-    args, _ = parser.parse_known_args()
+    parser.add_argument("--shots", type=int, default=1000)
+    parser.add_argument("--jobs", type=int, nargs="+", default=[1, 2, 4, 8, 16])
+    args = parser.parse_args()
 
-    if args.qrc_layers < 1 or args.n_jobs < 1:
+    if args.rows < 1 or args.cols < 1 or args.qrc_layers < 1:
+        print("rows, cols and qrc-layers must be > 0")
         return 1
 
-    stdin = sys.stdin.buffer
-    stdout = sys.stdout.buffer
+    qubits = args.cols
+    rng = np.random.default_rng(QRC_SEED)
+    data = rng.uniform(-1.0, 1.0, size=(args.rows, qubits))
+    reservoir = build_reservoir_params(qubits, args.qrc_layers, QRC_SEED)
 
-    while True:
-        header_bytes = read_exact(stdin, HEADER_SIZE)
-        if not header_bytes:
-            return 0
+    print(f"Dataset: {args.rows}x{qubits}, qrc-layers={args.qrc_layers}, shots={args.shots}")
+    print("\nRuntime by joblib job count:")
+    for n_jobs in args.jobs:
+        n = max(1, min(n_jobs, args.rows))
+        t0 = time.perf_counter()
+        run_reservoir(data, qubits, args.qrc_layers, reservoir, args.shots, n)
+        print(f"{n_jobs}\t{time.perf_counter() - t0:.4f}")
 
-        magic, version, msg_type, task_id, rows, cols_or_aux = struct.unpack(HEADER_FMT, header_bytes)
-
-        if magic != MAGIC or version != VERSION:
-            return 1
-
-        if msg_type == MSG_QUIT:
-            return 0
-
-        if msg_type != MSG_TASK:
-            send_error(stdout, task_id, f"unexpected message type: {msg_type}")
-            return 1
-
-        cols = cols_or_aux
-        qubits = int(cols)
-        if rows == 0 or qubits <= 0:
-            send_error(stdout, task_id, "rows and cols must be > 0")
-            return 1
-        if rows > MAX_ROWS or qubits > MAX_COLS:
-            send_error(stdout, task_id, "rows or cols out of range")
-            return 1
-
-        total_values = rows * qubits
-        if total_values > MAX_TOTAL_VALUES:
-            send_error(stdout, task_id, "task payload is too large")
-            return 1
-
-        payload_nbytes = total_values * 8
-
-        payload = read_exact(stdin, payload_nbytes)
-        if len(payload) != payload_nbytes:
-            return 1
-
-        vals = array("d")
-        vals.frombytes(payload)
-        if sys.byteorder != "little":
-            vals.byteswap()
-
-        reservoir = build_reservoir_params(qubits, args.qrc_layers, QRC_SEED)
-        shots = 1000
-
-        try:
-            expectations = run_reservoir(
-                vals, rows, cols, qubits, args.qrc_layers, reservoir, shots, args.n_jobs
-            )
-        except Exception as exc:  # report the failure to the C++ side instead of dying silently
-            send_error(stdout, task_id, f"worker computation failed: {exc}")
-            return 1
-
-        if len(expectations) != total_values:
-            send_error(stdout, task_id, "internal error: result size mismatch")
-            return 1
-
-        result_header = struct.pack(HEADER_FMT, MAGIC, VERSION, MSG_RESULT, task_id, rows, qubits)
-        out = array("d", expectations)
-        if sys.byteorder != "little":
-            out.byteswap()
-        result_payload = out.tobytes()
-        stdout.write(result_header)
-        stdout.write(result_payload)
-        stdout.flush()
+    return 0
 
 
 if __name__ == "__main__":
