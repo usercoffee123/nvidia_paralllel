@@ -129,17 +129,42 @@ def process_row(simulator, values, start: int, cols: int, qubits: int, layers: i
     return compute_z_expectations(counts, qubits, shots)
 
 
-def process_batch(values, begin_row: int, end_row: int, cols: int, qubits: int, layers: int, reservoir, shots: int):
-    """Process a contiguous block of rows and return their flattened Z expectations.
+def process_batch(chunk, n_rows: int, cols: int, qubits: int, layers: int, reservoir, shots: int):
+    """Process one shard of rows and return their flattened Z expectations.
 
-    Runs inside a joblib worker process, so it builds its own simulator (the
-    fixed seed keeps results deterministic regardless of how rows are sharded).
+    Runs inside a joblib worker process. It receives only its own slice of the
+    dataset and builds its own simulator; the fixed seed keeps results
+    deterministic regardless of how the rows are sharded.
     """
     simulator = AerSimulator(method="statevector", max_parallel_threads=1, seed_simulator=QRC_SEED)
     out = []
-    for row in range(begin_row, end_row):
-        out.extend(process_row(simulator, values, row * cols, cols, qubits, layers, reservoir, shots))
+    for row in range(n_rows):
+        out.extend(process_row(simulator, chunk, row * cols, cols, qubits, layers, reservoir, shots))
     return out
+
+
+def run_reservoir(values, rows: int, cols: int, qubits: int, layers: int, reservoir, shots: int, n_jobs: int):
+    """Shard rows across joblib worker processes and return flattened Z expectations.
+
+    Each shard is pickled with only its own slice of the data so a worker never
+    holds the whole dataset. joblib preserves dispatch order, so concatenating
+    the returned batches yields row-major output.
+    """
+    n_jobs = max(1, min(n_jobs, rows))
+    bounds = [(rows * i) // n_jobs for i in range(n_jobs + 1)]
+    batches = Parallel(n_jobs=n_jobs, backend="loky")(
+        delayed(process_batch)(
+            values[bounds[i] * cols:bounds[i + 1] * cols],
+            bounds[i + 1] - bounds[i],
+            cols,
+            qubits,
+            layers,
+            reservoir,
+            shots,
+        )
+        for i in range(n_jobs)
+    )
+    return [value for batch in batches for value in batch]
 
 
 def main() -> int:
@@ -199,16 +224,17 @@ def main() -> int:
         reservoir = build_reservoir_params(qubits, args.qrc_layers, QRC_SEED)
         shots = 1000
 
-        # Shard rows into contiguous batches and run them across joblib workers.
-        n_jobs = min(args.n_jobs, rows)
-        bounds = [(rows * i) // n_jobs for i in range(n_jobs + 1)]
-        batches = Parallel(n_jobs=n_jobs)(
-            delayed(process_batch)(
-                vals, bounds[i], bounds[i + 1], cols, qubits, args.qrc_layers, reservoir, shots
+        try:
+            expectations = run_reservoir(
+                vals, rows, cols, qubits, args.qrc_layers, reservoir, shots, args.n_jobs
             )
-            for i in range(n_jobs)
-        )
-        expectations = [value for batch in batches for value in batch]
+        except Exception as exc:  # report the failure to the C++ side instead of dying silently
+            send_error(stdout, task_id, f"worker computation failed: {exc}")
+            return 1
+
+        if len(expectations) != total_values:
+            send_error(stdout, task_id, "internal error: result size mismatch")
+            return 1
 
         result_header = struct.pack(HEADER_FMT, MAGIC, VERSION, MSG_RESULT, task_id, rows, qubits)
         out = array("d", expectations)
