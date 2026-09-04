@@ -39,7 +39,7 @@ def build_reservoir_params(qubits: int, layers: int, seed: int):
 
 def build_circuit(row_values, qubits: int, layers: int, reservoir):
     """Construct a Qiskit QuantumCircuit for one row of data."""
-    qc = QuantumCircuit(qubits, qubits)
+    qc = QuantumCircuit(qubits)
 
     def feature_angle(index: int) -> float:
         return math.pi * math.tanh(row_values[index % qubits])
@@ -66,39 +66,41 @@ def build_circuit(row_values, qubits: int, layers: int, reservoir):
             for q in range(qubits):
                 qc.cz(q, (q + 1) % qubits)
 
-    # Measure all qubits in the Z basis
-    qc.measure(range(qubits), range(qubits))
     return qc
 
 
-def compute_z_expectations(counts, qubits: int, shots: int):
-    """Compute <Z> expectation for each qubit from measurement counts."""
+def compute_z_expectations(statevector, qubits: int):
+    """Compute exact per-qubit <Z> expectations from a statevector."""
+    probabilities = np.abs(np.asarray(statevector)) ** 2
     expectations = [0.0] * qubits
-    for bitstring, count in counts.items():
-        # bitstring is e.g. '101' where bit 0 is qubit 0 (little-endian from Qiskit)
-        for q in range(qubits):
-            bit_val = int(bitstring[q])
-            expectations[q] += count * (1.0 - 2.0 * bit_val)
-    return [e / shots for e in expectations]
+    for q in range(qubits):
+        physical_qubit = qubits - 1 - q
+        expectation = 0.0
+        for basis, probability in enumerate(probabilities):
+            bit = (basis >> physical_qubit) & 1
+            expectation += probability * (1.0 - 2.0 * bit)
+        expectations[q] = float(expectation.real)
+    return expectations
 
 
-def process_batch(chunk, qubits: int, layers: int, reservoir, shots: int):
+def process_batch(chunk, qubits: int, layers: int, reservoir):
     """Process one shard of rows and return their flattened Z expectations.
 
     Runs inside a joblib worker process. It receives only its own slice of the
     dataset and builds its own simulator; the fixed seed keeps results
     deterministic regardless of how the rows are sharded.
     """
-    simulator = AerSimulator(method="statevector", max_parallel_threads=1, seed_simulator=QRC_SEED)
+    simulator = AerSimulator(method="statevector", max_parallel_threads=1)
     out = []
     for row in chunk:
         qc = build_circuit(row, qubits, layers, reservoir)
-        counts = simulator.run(qc, shots=shots).result().get_counts()
-        out.extend(compute_z_expectations(counts, qubits, shots))
+        qc.save_statevector()
+        statevector = simulator.run(qc).result().get_statevector()
+        out.extend(compute_z_expectations(statevector, qubits))
     return out
 
 
-def run_reservoir(data, qubits: int, layers: int, reservoir, shots: int, n_jobs: int):
+def run_reservoir(data, qubits: int, layers: int, reservoir, n_jobs: int):
     """Shard rows across n_jobs joblib workers and return flattened Z expectations.
 
     Each shard is pickled with only its own slice of the data so a worker never
@@ -109,7 +111,7 @@ def run_reservoir(data, qubits: int, layers: int, reservoir, shots: int, n_jobs:
     n_jobs = max(1, min(n_jobs, rows))
     bounds = [(rows * i) // n_jobs for i in range(n_jobs + 1)]
     batches = Parallel(n_jobs=n_jobs, backend="loky")(
-        delayed(process_batch)(data[bounds[i]:bounds[i + 1]], qubits, layers, reservoir, shots)
+        delayed(process_batch)(data[bounds[i]:bounds[i + 1]], qubits, layers, reservoir)
         for i in range(n_jobs)
     )
     return [value for batch in batches for value in batch]
@@ -120,7 +122,6 @@ def main() -> int:
     parser.add_argument("--rows", type=int, default=3000)
     parser.add_argument("--cols", type=int, default=6)
     parser.add_argument("--qrc-layers", type=int, default=2)
-    parser.add_argument("--shots", type=int, default=1000)
     parser.add_argument("--jobs", type=int, nargs="+", default=[1, 2, 4, 8, 16])
     args = parser.parse_args()
 
@@ -133,12 +134,12 @@ def main() -> int:
     data = rng.uniform(-1.0, 1.0, size=(args.rows, qubits))
     reservoir = build_reservoir_params(qubits, args.qrc_layers, QRC_SEED)
 
-    print(f"Dataset: {args.rows}x{qubits}, qrc-layers={args.qrc_layers}, shots={args.shots}")
+    print(f"Dataset: {args.rows}x{qubits}, qrc-layers={args.qrc_layers}")
     print("\nRuntime by joblib job count:")
     for n_jobs in args.jobs:
         n = max(1, min(n_jobs, args.rows))
         t0 = time.perf_counter()
-        run_reservoir(data, qubits, args.qrc_layers, reservoir, args.shots, n)
+        run_reservoir(data, qubits, args.qrc_layers, reservoir, n)
         print(f"{n_jobs}\t{time.perf_counter() - t0:.4f}")
 
     return 0

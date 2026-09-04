@@ -2,97 +2,61 @@
     "version": "2.0.0",
     "tasks": [
         {
-            "label": "CMake: Configure",
+            "label": "Run: worker",
             "type": "shell",
-            "command": "cmake",
+            "command": "${workspaceFolder}/ve/bin/python",
             "args": [
-                "-S",
-                ".",
-                "-B",
-                "build"
-            ],
-            "group": "build",
-            "problemMatcher": []
-        },
-        {
-            "label": "CMake: Build",
-            "type": "shell",
-            "command": "cmake",
-            "args": [
-                "--build",
-                "build",
-                "-j"
-            ],
-            "group": {
-                "kind": "build",
-                "isDefault": true
-            },
-            "dependsOn": "CMake: Configure",
-            "problemMatcher": [
-                "$gcc"
-            ]
-        },
-        {
-            "label": "Run: parallel_python",
-            "type": "shell",
-            "command": "${workspaceFolder}/build/parallel_python",
-            "args": [
+                "${workspaceFolder}/python/worker.py",
                 "--rows",
                 "3000",
                 "--cols",
                 "6"
             ],
-            "dependsOn": "CMake: Build",
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
             "problemMatcher": []
         },
         {
-            "label": "Run: parallel_python (large)",
+            "label": "Run: worker (large)",
             "type": "shell",
-            "command": "${workspaceFolder}/build/parallel_python",
+            "command": "${workspaceFolder}/ve/bin/python",
             "args": [
+                "${workspaceFolder}/python/worker.py",
                 "--rows",
                 "200000",
                 "--cols",
                 "8"
             ],
-            "dependsOn": "CMake: Build",
             "problemMatcher": []
         },
         {
-            "label": "Run: unit_tests (ASan+UBSan)",
+            "label": "Run: tests",
             "type": "shell",
-            "command": "${workspaceFolder}/build/unit_tests",
-            "args": [],
-            "dependsOn": "CMake: Build",
-            "group": "test",
-            "problemMatcher": []
-        },
-        {
-            "label": "Run: worker_integration_test (ASan+UBSan)",
-            "type": "shell",
-            "command": "${workspaceFolder}/build/worker_integration_test",
-            "args": [],
-            "dependsOn": "CMake: Build",
-            "group": "test",
-            "problemMatcher": []
-        },
-        {
-            "label": "Run: worker_tsan_test (TSan+UBSan)",
-            "type": "shell",
-            "command": "${workspaceFolder}/build/worker_tsan_test",
-            "args": [],
-            "dependsOn": "CMake: Build",
-            "group": "test",
-            "problemMatcher": []
-        },
-        {
-            "label": "Run: all tests",
-            "dependsOn": [
-                "Run: unit_tests (ASan+UBSan)",
-                "Run: worker_integration_test (ASan+UBSan)",
-                "Run: worker_tsan_test (TSan+UBSan)"
+            "command": "${workspaceFolder}/ve/bin/python",
+            "args": [
+                "-m",
+                "pytest",
+                "-q"
             ],
-            "dependsOrder": "sequence",
+            "group": {
+                "kind": "test",
+                "isDefault": true
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "Run: tests (fast only)",
+            "type": "shell",
+            "command": "${workspaceFolder}/ve/bin/python",
+            "args": [
+                "-m",
+                "pytest",
+                "-q",
+                "-m",
+                "not slow"
+            ],
             "group": "test",
             "problemMatcher": []
         }

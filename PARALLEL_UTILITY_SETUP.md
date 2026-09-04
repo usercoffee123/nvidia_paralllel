@@ -1,156 +1,88 @@
-# Parallel Python Worker Utility Setup
+# Parallel Quantum Reservoir Worker Utility Setup
 
 ## Purpose
 
-This project is a small C++ utility for running Python workers in parallel on row-chunked data.
+This project is a small Python utility for running a quantum reservoir computing
+(QRC) simulation in parallel over row-chunked data.
 
 The current implementation focuses on:
 
-- Simple process-based parallelism.
-- A stable binary IPC protocol between C++ and Python.
-- Deterministic test behavior (seeded inputs and seeded simulator in the Python worker).
+- Simple process-based parallelism via joblib.
+- A deterministic quantum kernel (seeded inputs and seeded Qiskit Aer simulator).
+- Straightforward benchmarking across different worker counts.
 
 ## High-Level Architecture
 
-1. C++ builds a row-major dataset.
-2. C++ splits rows into chunks.
-3. Each chunk is sent to a dedicated Python worker subprocess.
-4. Python processes a chunk and returns row-major results.
-5. C++ reassembles all chunk outputs into one contiguous result buffer.
+1. Python builds a row-major dataset with NumPy.
+2. Rows are split into contiguous shards.
+3. Each shard is dispatched to a joblib worker process (`loky` backend).
+4. Each worker runs a Qiskit Aer simulation per row and returns Z expectations.
+5. joblib preserves dispatch order, so shard outputs concatenate into a
+   row-major result.
 
-Core files:
+Core file:
 
-- `src/main.cpp`: CLI parsing, dataset generation, benchmark driver.
-- `src/worker_process.h`: `Worker` function object and generic `parallel_map` utility.
-- `src/worker_process.cpp`: subprocess + pipe IPC implementation.
-- `src/protocol.h`: message header and message type enums.
-- `src/dataset.h`: row-major `Dataset` + lightweight `DataView`.
-- `python/worker.py`: Python worker entrypoint.
+- `python/worker.py`: CLI parsing, dataset generation, circuit construction,
+  joblib sharding, and the benchmark driver.
 
-## IPC Contract
+## Key Functions
 
-Messages use `MessageHeader` (`src/protocol.h`) followed by optional payload data.
+- `build_reservoir_params(qubits, layers, seed)` – deterministic `(rx, rz)`
+  rotation angles per layer and qubit.
+- `build_circuit(row_values, qubits, layers, reservoir)` – constructs the Qiskit
+- `QuantumCircuit` for one row (feature encoding, `CZ` ring, and reservoir layers).
+- `compute_z_expectations(statevector, qubits)` – exact per-qubit `<Z>` from amplitudes.
+- `process_batch(chunk, qubits, layers, reservoir)` – runs inside a joblib
+  worker; builds its own simulator and processes only its slice of rows.
+- `run_reservoir(data, qubits, layers, reservoir, n_jobs)` – shards rows
+  across `n_jobs` workers and returns the flattened Z expectations.
 
-Message types:
+## Setup
 
-- `Task`: C++ -> Python, includes rows, cols, and input doubles.
-- `Quit`: C++ -> Python, tells worker to exit.
-- `Result`: Python -> C++, includes output shape and output doubles.
-- `Error`: Python -> C++, includes UTF-8 error text.
-
-The current wire format is little-endian and matches `<IHHQQQ>` in Python.
-
-Header fields:
-
-- `magic` = `0x50595043` (`CPYP`), used as a fast sanity check.
-- `version` = `1`, so both sides can reject incompatible protocol changes early.
-- `type` = `Task`, `Quit`, `Result`, or `Error`.
-- `taskId` = request identifier; responses must echo the same value.
-- `rows` = row count for normal messages, or error-message byte length for `Error`.
-- `cols` = input column count for `Task`, output column count for `Result`, or auxiliary length for `Error`.
-
-Payload rules:
-
-- `Task` payloads are `rows * cols` `double` values in row-major order.
-- `Result` payloads are `rows * resultCols` `double` values in row-major order.
-- `Quit` has no payload.
-- `Error` appends `rows` bytes of UTF-8 text immediately after the header.
-
-The C++ transport validates `magic`, `version`, and `taskId` on replies before reading the payload. The Python worker uses the same header layout via `struct.pack` and `struct.unpack` with `HEADER_FMT = "<IHHQQQ"`.
-
-Example flow:
-
-1. C++ creates a `Task` header for a chunk of rows and writes it to the worker pipe.
-2. C++ immediately writes the chunk's raw doubles in row-major order.
-3. Python reads the 32-byte header, uses `rows` and `cols` to know how much data to read, and reconstructs the input matrix.
-4. Python runs the simulation for each row and then writes back a `Result` header with the same `taskId`.
-5. Python appends the output doubles, and C++ copies them into the correct slice of the final output buffer.
-6. If Python cannot process the chunk, it sends an `Error` header plus UTF-8 text instead of a `Result` payload.
-
-## Parallel API Surface
-
-`Worker` is a callable object:
-
-```cpp
-std::vector<double> operator()(std::size_t taskId,
-                               const DataView& input,
-                               std::size_t& resultCols) const;
-```
-
-`parallel_map` is the reusable utility:
-
-```cpp
-template <typename WorkerFn>
-std::vector<double> parallel_map(const WorkerFn& worker,
-                                 const DataView& fullData,
-                                 std::size_t numWorkers);
-```
-
-This keeps call sites functional in style: pass a callable + data view + worker count, receive one combined result vector.
-
-## Build and Test
-
-Build:
-
-```bash
-cmake -S . -B build
-cmake --build build -j
-```
-
-Activate Python environment:
+Activate the Python environment and install dependencies:
 
 ```bash
 source ve/bin/activate
+pip install -r requirements.txt
 ```
 
-Run tests:
+## Run
+
+Run the benchmark:
 
 ```bash
-./build/unit_tests
-./build/worker_integration_test
-./build/worker_tsan_test
+python python/worker.py --rows 3000 --cols 6
 ```
 
-Run benchmark:
+Sweep specific job counts and tune the circuit:
 
 ```bash
-./build/parallel_python --rows 3000 --cols 6
+python python/worker.py --rows 3000 --cols 6 --qrc-layers 3 --jobs 1 4 8
 ```
 
-Run benchmark with Linux worker CPU pinning enabled:
+Relevant CLI options:
 
-```bash
-./build/parallel_python --rows 3000 --cols 6 \
-    --pin-workers-single-cpu --cpu-start 0 --cpu-stride 1
-```
-
-Relevant CLI options in the current build:
-
-- `--rows` and `--cols` are required.
-- `--python` overrides the Python executable.
-- `--worker-script` overrides the worker script path.
-- `--pin-workers-single-cpu`, `--cpu-start`, and `--cpu-stride` control Linux-only affinity behavior.
+- `--rows` – dataset rows, default `3000`.
+- `--cols` – columns / qubits, default `6`.
+- `--qrc-layers` – reservoir layers, default `2`.
+- `--jobs` – one or more joblib worker counts to sweep, default `1 2 4 8 16`.
 
 ## Notes on Determinism and Performance
 
-- Input generation in C++ is seeded.
-- Python worker is configured to reduce thread oversubscription.
-- Quantum simulation uses explicit seeding and fixed shots for reproducible tests.
-
-CPU pinning and NUMA notes:
-
-- Pinning each worker to one CPU can reduce scheduler migrations and improve cache locality.
-- This can help on NUMA systems when each worker is mostly CPU-bound and memory reuse is local.
-- It is not universally faster: strict pinning can hurt if load is imbalanced or if worker count exceeds available physical cores.
-- Current implementation applies Linux-only affinity (`sched_setaffinity`) in the child before launching Python.
-- On non-Linux systems, pinning flags are accepted but affinity is a no-op.
+- Input generation uses a seeded NumPy generator (`QRC_SEED = 42`).
+- BLAS/OpenMP thread counts are pinned to `1` before importing NumPy/Qiskit so
+  parallel joblib workers do not oversubscribe CPU cores.
+- Reservoir angles are derived from the fixed seed, and exact statevector
+  expectations are independent of shard count.
+- More workers reduce wall-clock time up to the point where process startup and
+  simulator construction overhead dominates for a given dataset size.
 
 ## Direction for Reusable Utility Evolution
 
-To evolve this into a general utility for "kick off N Python processes on chunks":
+To evolve this into a general "shard rows across N Python workers" utility:
 
-1. Introduce a pluggable worker command (script/module + args).
-2. Make chunking strategy configurable (fixed rows, dynamic queue, strided).
-3. Add retry policy around worker failures.
-4. Add result serializer abstraction beyond `double` arrays.
+1. Make the per-row kernel pluggable instead of hard-coded to the QRC circuit.
+2. Make the chunking strategy configurable (fixed rows, dynamic queue, strided).
+3. Add a retry policy around worker failures.
+4. Return or persist the result matrix instead of discarding it after timing.
 5. Add optional worker pool warmup and lifecycle metrics.

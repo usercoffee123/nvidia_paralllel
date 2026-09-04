@@ -1,132 +1,151 @@
-# Project Overview: Parallel C++/Python Data Processing
+# Project Overview: Parallel Quantum Reservoir Computing Benchmark
 
 ## Purpose
 
-This project demonstrates a parallel processing pipeline where a C++ executable keeps a row-major dataset in memory, splits it into contiguous row chunks, and off-loads each chunk to a Python worker process. The Python side performs a Qiskit Aer quantum reservoir style simulation per row and returns a row-major matrix of Z expectation values.
+This project demonstrates how a quantum reservoir computing (QRC) simulation can be
+parallelized across worker processes. A row-major dataset is generated in memory,
+split into contiguous row shards, and each shard is processed by a
+[joblib](https://joblib.readthedocs.io/) worker that runs a Qiskit Aer state-vector
+simulation per row and returns a matrix of Z expectation values. The program
+benchmarks how the total runtime scales with the number of parallel workers.
+
+The entire implementation lives in a single Python file: `python/worker.py`.
 
 ---
 
 ## Architecture
 
 ```
-+-------------------+        +-------------------+        +-------------------+
-|   C++ executable  |  IPC   |   Python worker   |  IPC   |   C++ executable   |
-| (master process)  | <----> |   (child process)  | <----> | (aggregates results) |
-+-------------------+        +-------------------+        +-------------------+
++------------------------+        +------------------------+
+|   Main process         |        |   joblib workers        |
+| (dataset + benchmark)  |  fork  |  (loky backend)         |
+|                        | -----> |  one Qiskit sim / shard |
++------------------------+        +------------------------+
 ```
 
-* **C++ master**
-  * Generates a random dataset (row-major `std::vector<double>`).
-  * Splits the rows as evenly as possible among the requested number of workers.
-  * Uses `std::async` to launch one subprocess-backed worker per chunk.
-  * Forks/execs the Python script, establishing a pair of pipes for binary communication.
-  * Sends a binary *task* header followed by the raw double payload.
-  * Receives a binary *result* header and a matrix of expectation values.
-  * Benchmarks the whole pipeline over a fixed set of worker counts `{1,2,4,8,16}`.
-  * Can optionally pin each worker to a Linux CPU using `--pin-workers-single-cpu`.
+* **Main process** (`main` in `python/worker.py`)
+  * Parses CLI arguments (`--rows`, `--cols`, `--qrc-layers`, `--jobs`).
+  * Generates a random dataset with NumPy (`default_rng`, seed `42`).
+  * Builds deterministic reservoir rotation parameters from the fixed seed.
+  * Sweeps the requested joblib job counts and times each run.
 
-* **Python worker** (`python/worker.py`)
-  * Reads the binary header and payload from `stdin.buffer`.
-  * Runs a Qiskit Aer simulation per row (state-vector backend, one circuit per input row).
-  * Returns a header and a matrix of Z-expectation values (one column per qubit / input column).
-  * Uses fixed seeds for deterministic reservoir parameters and simulator output.
+* **joblib workers** (`process_batch` in `python/worker.py`)
+  * Each worker receives only its own contiguous slice of the dataset.
+  * Builds a Qiskit `QuantumCircuit` per row and runs it on an `AerSimulator`
+    (`statevector` method, seeded, single-threaded).
+  * Returns the flattened Z expectations for its rows.
 
-* **Binary protocol** (little‑endian)
-  * Header format: `<IHHQQQ>` → `magic`, `version`, `type`, `taskId`, `rows`, `cols`.
-  * `magic` is the four-byte constant `0x50595043` (`CPYP`), and `version` is currently `1`.
-  * `taskId` is echoed by the worker so the C++ side can match requests and responses.
-  * For `Task`, `rows` is the number of dataset rows in the chunk and `cols` is the input column count.
-  * For `Result`, `rows` is the number of output rows and `cols` is the output column count returned by the worker.
-  * For `Error`, `rows` stores the UTF-8 error-message byte length and `cols` is used as an auxiliary length field.
-  * Payloads are raw `double` arrays (`rows × cols` for tasks, `rows × expectation_cols` for results).
-  * `Quit` carries only the header and no payload.
-
-  * Example flow: the C++ process sends a `Task` header for one chunk, immediately followed by that chunk's raw row-major doubles. The worker reads the header, knows how many bytes to expect from `rows × cols`, runs the circuit simulation row by row, and sends a `Result` header back with the same `taskId`. The C++ side uses that echoed `taskId` and the reported output shape to copy the returned doubles into the correct place in the overall matrix. If something goes wrong, the worker sends an `Error` message instead, and the C++ side reads the UTF-8 error text after the header.
+* **Determinism**
+  * Reservoir angles and simulator output are seeded, so results are identical
+    regardless of how many workers the rows are sharded across.
 
 ---
 
 ## Data Flow
-1. **Dataset generation** – `std::mt19937_64` seeded to `42`, uniform real distribution in `[-1.0, 1.0]`.
-2. **Row partitioning** – For `N` workers, rows are split into contiguous chunks as evenly as possible.
-3. **Task transmission** – Master writes the binary header + `rows_slice × cols` doubles to the worker pipe.
-4. **Quantum simulation** – Worker builds a circuit, applies feature encoding plus reservoir layers with `RY`, `RZ`, `RX`, and `CZ`, then computes Z-expectations for each qubit.
-5. **Result transmission** – Worker writes a result header + `rows_slice × expectation_cols` doubles back to the master.
-6. **Aggregation** – Master collects all slices, assembles the full expectation matrix, and discards it after timing.
 
-The transport is strictly stream-based: each header is written first, followed immediately by the fixed-size payload for that message type. The worker process exits on `Quit` or EOF, and the C++ side sends `Quit` during destruction after it has finished reading results.
+1. **Dataset generation** – `np.random.default_rng(42)` produces a `rows x cols`
+   matrix uniformly distributed in `[-1.0, 1.0]`.
+2. **Reservoir parameters** – `build_reservoir_params` derives deterministic
+   `(rx, rz)` rotation angles for every layer and qubit from the fixed seed.
+3. **Row sharding** – `run_reservoir` splits the rows into `n_jobs` contiguous
+   shards using integer bounds so each worker gets a near-equal slice.
+4. **Quantum simulation** – Each worker builds a circuit per row via
+   `build_circuit`: feature encoding (`RY`/`RZ`), a `CZ` entangling ring, then
+   `--qrc-layers` reservoir layers (`RX`/`RZ` + `CZ`), followed by Z-basis
+  and returns its statevector.
+5. **Expectation values** – `compute_z_expectations` converts statevector
+  probabilities into an exact per-qubit `<Z>` value in `[-1, 1]`.
+6. **Aggregation** – joblib preserves dispatch order, so concatenating the shard
+   outputs yields a row-major expectation matrix. The benchmark discards the
+   result after timing each job count.
+
+---
+
+## Circuit Construction
+
+For a row with `qubits = cols`:
+
+* **Feature encoding** – For each qubit `q`, `theta = pi * tanh(row[q])`, then
+  `RY(theta)` and `RZ(0.5 * theta)`.
+* **Entangling ring** – `CZ(q, (q + 1) % qubits)` for each qubit (when `qubits > 1`).
+* **Reservoir layers** – For each layer, apply `RX(base_rx + injection)` and
+  `RZ(base_rz - 0.25 * injection)` per qubit, where `injection` mixes the feature
+  angle back in, followed by another `CZ` ring.
 
 ---
 
 ## Benchmarking
-The executable always runs a benchmark loop over the worker counts `{1,2,4,8,16}` (or fewer if the dataset has fewer rows). For each count it reports:
 
-* **Requested workers** – the sweep value, not a user-supplied `--workers` flag.
-* **Used workers** – `min(requested, total_rows)`.
-* **Elapsed time** – wall-clock seconds for the whole round-trip.
+The program sweeps the job counts passed via `--jobs` (default `{1, 2, 4, 8, 16}`),
+clamping each to `min(jobs, rows)`. For each count it prints the wall-clock seconds
+for the full run.
 
 Typical output (truncated):
+
 ```
-  workers(requested)  workers(used)  time(s)
-  ------------------  -------------  --------
-                   1              1  0.420000
-                   2              2  0.230000
-                   4              4  0.140000
-                   8              8  0.090000
-                  16             16  0.070000
+Dataset: 3000x6, qrc-layers=2
+
+Runtime by joblib job count:
+1	4.1234
+2	2.2103
+4	1.1876
+8	0.7421
+16	0.6210
 ```
 
 ---
 
-## Building & Running
+## Running
+
 ### Prerequisites
-* C++ compiler with C++17 support (e.g., `clang++` or `g++`).
-* CMake 3.16 or newer.
-* Python 3 with `numpy`, `qiskit`, and `qiskit-aer` installed.
 
-### Build (command line)
+* Python 3 with `numpy`, `qiskit`, `qiskit-aer`, and `joblib` installed.
+
+### Setup
+
 ```bash
-cmake -S . -B build
-cmake --build build -j
+source ve/bin/activate
+pip install -r requirements.txt
 ```
-The resulting executable is `build/parallel_python`.
 
-### VS Code integration
-The workspace defines VS Code tasks for configuring, building, and running the binaries, including the sanitizer-backed test executables.
+### Command-line usage
 
-You can invoke the run tasks via **Terminal → Run Task…**.
-
-### Command‑line usage
 ```bash
-./build/parallel_python --rows <NUM_ROWS> --cols <NUM_COLS>
+python python/worker.py --rows <NUM_ROWS> --cols <NUM_COLS>
 ```
-* `--rows` – total number of dataset rows, required.
-* `--cols` – number of columns and the number of qubits used by the simulation, required.
-* `--pin-workers-single-cpu` – optional Linux-only CPU pinning.
-* `--cpu-start` / `--cpu-stride` – CPU selection controls used when pinning.
 
-There is no `--workers` or `--chunk-rows` flag; worker counts are swept internally.
+* `--rows` – number of dataset rows, default `3000`.
+* `--cols` – number of columns / qubits, default `6`.
+* `--qrc-layers` – number of reservoir layers, default `2`.
+* `--jobs` – one or more joblib worker counts to sweep, default `1 2 4 8 16`.
 
 ---
 
 ## Configuration Details
+
 | Parameter | Description | Default |
 |-----------|-------------|---------|
-| `rows` | Number of rows in the dataset. | **required** |
-| `cols` | Number of columns (also qubits). | **required** |
-| RNG seed | Fixed to `42` for reproducibility. | 42 |
+| `rows` | Number of rows in the dataset. | `3000` |
+| `cols` | Number of columns (also qubits). | `6` |
+| `qrc-layers` | Reservoir layers in the circuit. | `2` |
+| `jobs` | joblib worker counts to benchmark. | `1 2 4 8 16` |
+| RNG seed | Fixed to `42` for reproducibility. | `42` |
 | Data range | Uniform real distribution `[-1.0, 1.0]`. | – |
-| Worker count | Internally iterates over `{1,2,4,8,16}` (capped by `rows`). | – |
-| CPU pinning | Linux-only, disabled unless `--pin-workers-single-cpu` is set. | off |
 
 ---
 
 ## Extending the Project
-* **Add more worker logic** – modify `python/worker.py` to perform different scientific kernels.
-* **Change the protocol** – adjust `src/protocol.h`, the C++ worker transport in `src/worker_process.cpp`, and the Python parsing code together.
-* **Expose more CLI options** – extend `parse_args` in `src/main.cpp`.
-* **Integrate with other languages** – the binary protocol is language‑agnostic; any process that can read/write the defined header and double payload can become a worker.
+
+* **Change the kernel** – modify `build_circuit` to implement a different quantum
+  or classical per-row computation.
+* **Change sharding** – adjust `run_reservoir` to use a different chunking strategy
+  or joblib backend.
+* **Expose more options** – extend the `argparse` setup in `main`.
+* **Add outputs** – return or persist the expectation matrix instead of discarding
+  it after timing.
 
 ---
 
 ## License
+
 This example code is provided under the MIT License. See the `LICENSE` file for details.

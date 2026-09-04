@@ -2,10 +2,10 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "Run parallel_python",
-            "type": "cppdbg",
+            "name": "Run worker",
+            "type": "debugpy",
             "request": "launch",
-            "program": "${workspaceFolder}/build/parallel_python",
+            "program": "${workspaceFolder}/python/worker.py",
             "args": [
                 "--rows",
                 "3000",
@@ -13,50 +13,14 @@
                 "6"
             ],
             "cwd": "${workspaceFolder}",
-            "environment": [],
-            "externalConsole": false,
-            "MIMode": "lldb",
-            "preLaunchTask": "CMake: Build"
+            "python": "${workspaceFolder}/ve/bin/python",
+            "console": "integratedTerminal"
         },
         {
-            "name": "Debug parallel_python",
-            "type": "cppdbg",
+            "name": "Run worker (large)",
+            "type": "debugpy",
             "request": "launch",
-            "program": "${workspaceFolder}/build/parallel_python",
-            "args": [
-                "--rows",
-                "3000",
-                "--cols",
-                "6"
-            ],
-            "cwd": "${workspaceFolder}",
-            "environment": [],
-            "externalConsole": false,
-            "MIMode": "lldb",
-            "preLaunchTask": "CMake: Build"
-        },
-        {
-            "name": "Run parallel_python (large)",
-            "type": "cppdbg",
-            "request": "launch",
-            "program": "${workspaceFolder}/build/parallel_python",
-            "args": [
-                "--rows",
-                "4000",
-                "--cols",
-                "9"
-            ],
-            "cwd": "${workspaceFolder}",
-            "environment": [],
-            "externalConsole": false,
-            "MIMode": "lldb",
-            "preLaunchTask": "CMake: Build"
-        },
-        {
-            "name": "Debug parallel_python (large)",
-            "type": "cppdbg",
-            "request": "launch",
-            "program": "${workspaceFolder}/build/parallel_python",
+            "program": "${workspaceFolder}/python/worker.py",
             "args": [
                 "--rows",
                 "20000",
@@ -64,46 +28,8 @@
                 "9"
             ],
             "cwd": "${workspaceFolder}",
-            "environment": [],
-            "externalConsole": false,
-            "MIMode": "lldb",
-            "preLaunchTask": "CMake: Build"
-        },
-        {
-            "name": "Run unit_tests (ASan+UBSan)",
-            "type": "cppdbg",
-            "request": "launch",
-            "program": "${workspaceFolder}/build/unit_tests",
-            "args": [],
-            "cwd": "${workspaceFolder}",
-            "environment": [],
-            "externalConsole": true,
-            "MIMode": "lldb",
-            "preLaunchTask": "CMake: Build"
-        },
-        {
-            "name": "Run worker_integration_test (ASan+UBSan)",
-            "type": "cppdbg",
-            "request": "launch",
-            "program": "${workspaceFolder}/build/worker_integration_test",
-            "args": [],
-            "cwd": "${workspaceFolder}",
-            "environment": [],
-            "externalConsole": true,
-            "MIMode": "lldb",
-            "preLaunchTask": "CMake: Build"
-        },
-        {
-            "name": "Run worker_tsan_test (TSan+UBSan)",
-            "type": "cppdbg",
-            "request": "launch",
-            "program": "${workspaceFolder}/build/worker_tsan_test",
-            "args": [],
-            "cwd": "${workspaceFolder}",
-            "environment": [],
-            "externalConsole": true,
-            "MIMode": "lldb",
-            "preLaunchTask": "CMake: Build"
+            "python": "${workspaceFolder}/ve/bin/python",
+            "console": "integratedTerminal"
         }
     ]
 }

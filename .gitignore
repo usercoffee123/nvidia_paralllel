@@ -1,1 +1,4 @@
 build/
+ve/
+python/__pycache__/
+tests/__pycache__/
