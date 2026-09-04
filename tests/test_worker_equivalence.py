@@ -1,8 +1,7 @@
 """Worker correctness and equivalence tests.
 
-These tests are the harness for validating any worker backend (the current
-Qiskit Aer CPU worker, or a future CUDA-Q / GPU worker) against an independent
-analytic statevector reference. The GPU worker only needs to expose a
+These tests validate the CUDA-Q worker against an independent
+analytic statevector reference. The worker only needs to expose a
 ``process_batch``-compatible callable; feed it through ``assert_worker_matches``
 below with the same reservoir/data and it will be held to the same ground truth.
 """

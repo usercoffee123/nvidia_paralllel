@@ -1,0 +1,163 @@
+[1mdiff --git a/python/worker.py b/python/worker.py[m
+[1mindex 34bd76c..bbd445b 100644[m
+[1m--- a/python/worker.py[m
+[1m+++ b/python/worker.py[m
+[36m@@ -14,6 +14,7 @@[m [mos.environ["NUMEXPR_NUM_THREADS"] = "1"[m
+ import argparse[m
+ from concurrent.futures import ThreadPoolExecutor[m
+ import math[m
+[32m+[m[32mimport sys[m
+ import time[m
+ [m
+ import numpy as np[m
+[36m@@ -106,8 +107,42 @@[m [mdef process_batch(chunk, qubits: int, layers: int, reservoir):[m
+     return out[m
+ [m
+ [m
+[31m-def process_batch_cudaq(chunk, qubits: int, layers: int, reservoir, target="nvidia"):[m
+[31m-    """Process rows with CUDA-Q and return flattened exact Z expectations.[m
+[32m+[m[32mdef _build_cudaq_kernel(qubits: int, layers: int, reservoir):[m
+[32m+[m[32m    """Build the parameterized CUDA-Q circuit used for every input batch."""[m
+[32m+[m[32m    kernel, *feature_angles = cudaq.make_kernel(*([float] * qubits))[m
+[32m+[m[32m    qubit_register = kernel.qalloc(qubits)[m
+[32m+[m
+[32m+[m[32m    for q in range(qubits):[m
+[32m+[m[32m        theta = feature_angles[q][m
+[32m+[m[32m        kernel.ry(theta, qubit_register[q])[m
+[32m+[m[32m        kernel.rz(0.5 * theta, qubit_register[q])[m
+[32m+[m
+[32m+[m[32m    if qubits > 1:[m
+[32m+[m[32m        for q in range(qubits):[m
+[32m+[m[32m            kernel.cz(qubit_register[q], qubit_register[(q + 1) % qubits])[m
+[32m+[m
+[32m+[m[32m    for layer in range(layers):[m
+[32m+[m[32m        for q in range(qubits):[m
+[32m+[m[32m            base_rx, base_rz = reservoir[layer][q][m
+[32m+[m[32m            injection = 0.35 * feature_angles[(q + layer) % qubits][m
+[32m+[m[32m            kernel.rx(base_rx + injection, qubit_register[q])[m
+[32m+[m[32m            kernel.rz(base_rz - 0.25 * injection, qubit_register[q])[m
+[32m+[m[32m        if qubits > 1:[m
+[32m+[m[32m            for q in range(qubits):[m
+[32m+[m[32m                kernel.cz(qubit_register[q], qubit_register[(q + 1) % qubits])[m
+[32m+[m
+[32m+[m[32m    return kernel[m
+[32m+[m
+[32m+[m
+[32m+[m[32mdef process_batch_cudaq([m
+[32m+[m[32m    chunk,[m
+[32m+[m[32m    qubits: int,[m
+[32m+[m[32m    layers: int,[m
+[32m+[m[32m    reservoir,[m
+[32m+[m[32m    target="nvidia",[m
+[32m+[m[32m    progress=False,[m
+[32m+[m[32m):[m
+[32m+[m[32m    """Process all rows with one parameterized, broadcast CUDA-Q call.[m
+ [m
+     ``target`` is injectable so tests can use CUDA-Q's CPU statevector target;[m
+     production calls use the NVIDIA target by default.[m
+[36m@@ -115,40 +150,44 @@[m [mdef process_batch_cudaq(chunk, qubits: int, layers: int, reservoir, target="nvid[m
+     if cudaq is None:[m
+         raise RuntimeError("CUDA-Q is required when --gpu-percent is nonzero")[m
+ [m
+[31m-    cudaq.set_target(target)[m
+[31m-    out = [][m
+[31m-    for row in chunk:[m
+[31m-        kernel = cudaq.make_kernel()[m
+[31m-        qubit_register = kernel.qalloc(qubits)[m
+[31m-[m
+[31m-        def feature_angle(index: int) -> float:[m
+[31m-            return math.pi * math.tanh(row[index % qubits])[m
+[32m+[m[32m    if target == "nvidia":[m
+[32m+[m[32m        # mqpu exposes each GPU as a QPU so async submissions run concurrently.[m
+[32m+[m[32m        cudaq.set_target(target, option="mqpu")[m
+[32m+[m[32m        num_qpus = cudaq.num_available_gpus()[m
+[32m+[m[32m        if num_qpus == 0:[m
+[32m+[m[32m            raise RuntimeError([m
+[32m+[m[32m                "CUDA-Q NVIDIA target is selected, but no GPU is available"[m
+[32m+[m[32m            )[m
+[32m+[m[32m    else:[m
+[32m+[m[32m        cudaq.set_target(target)[m
+[32m+[m[32m        num_qpus = 1[m
+ [m
+[31m-        for q in range(qubits):[m
+[31m-            theta = feature_angle(q)[m
+[31m-            kernel.ry(theta, qubit_register[q])[m
+[31m-            kernel.rz(0.5 * theta, qubit_register[q])[m
+[32m+[m[32m    if progress:[m
+[32m+[m[32m        print(f"GPU: starting {len(chunk)} rows on {target}", flush=True)[m
+[32m+[m[32m    if not len(chunk):[m
+[32m+[m[32m        return [][m
+ [m
+[31m-        if qubits > 1:[m
+[31m-            for q in range(qubits):[m
+[31m-                kernel.cz(qubit_register[q], qubit_register[(q + 1) % qubits])[m
+[32m+[m[32m    kernel = _build_cudaq_kernel(qubits, layers, reservoir)[m
+[32m+[m[32m    # One composite observable per row; per-qubit values are recovered per term.[m
+[32m+[m[32m    z_terms = [cudaq.spin.z(qubits - 1 - q) for q in range(qubits)][m
+[32m+[m[32m    composite = z_terms[0][m
+[32m+[m[32m    for term in z_terms[1:]:[m
+[32m+[m[32m        composite = composite + term[m
+[32m+[m
+[32m+[m[32m    angles = math.pi * np.tanh(np.asarray(chunk, dtype=float))[m
+[32m+[m[32m    futures = [[m
+[32m+[m[32m        cudaq.observe_async([m
+[32m+[m[32m            kernel, composite, *angles[i], qpu_id=i % num_qpus, shots_count=0[m
+[32m+[m[32m        )[m
+[32m+[m[32m        for i in range(len(angles))[m
+[32m+[m[32m    ][m
+ [m
+[31m-        for layer in range(layers):[m
+[31m-            for q in range(qubits):[m
+[31m-                base_rx, base_rz = reservoir[layer][q][m
+[31m-                injection = 0.35 * feature_angle(q + layer)[m
+[31m-                kernel.rx(base_rx + injection, qubit_register[q])[m
+[31m-                kernel.rz(base_rz - 0.25 * injection, qubit_register[q])[m
+[31m-            if qubits > 1:[m
+[31m-                for q in range(qubits):[m
+[31m-                    kernel.cz(qubit_register[q], qubit_register[(q + 1) % qubits])[m
+[31m-[m
+[31m-        # Output index q maps to physical qubit qubits-1-q (see compute_z_expectations).[m
+[31m-        for q in range(qubits):[m
+[31m-            result = cudaq.observe([m
+[31m-                kernel, cudaq.spin.z(qubits - 1 - q), shots_count=0[m
+[31m-            )[m
+[31m-            out.append(float(result.expectation()))[m
+[32m+[m[32m    out = [][m
+[32m+[m[32m    for row_index, future in enumerate(futures, start=1):[m
+[32m+[m[32m        result = future.get()[m
+[32m+[m[32m        out.extend(float(result.expectation(term)) for term in z_terms)[m
+[32m+[m[32m        if progress and (row_index == 1 or row_index % 100 == 0 or row_index == len(futures)):[m
+[32m+[m[32m            print(f"GPU: {row_index}/{len(futures)} rows", file=sys.stderr, flush=True)[m
+     return out[m
+ [m
+ [m
+[36m@@ -197,7 +236,7 @@[m [mdef run_hybrid([m
+             run_reservoir, cpu_data, qubits, layers, reservoir, n_jobs[m
+         )[m
+         gpu_result = process_batch_cudaq([m
+[31m-            gpu_data, qubits, layers, reservoir, target=cuda_target[m
+[32m+[m[32m            gpu_data, qubits, layers, reservoir, target=cuda_target, progress=True[m
+         )[m
+         cpu_result = cpu_future.result()[m
+     return gpu_result + cpu_result[m
+[1mdiff --git a/run.sh b/run.sh[m
+[1mindex 7b26d88..6b3a992 100755[m
+[1m--- a/run.sh[m
+[1m+++ b/run.sh[m
+[36m@@ -1,4 +1,13 @@[m
+ ROWS=${1:-10000}[m
+[31m-COLS=${2:-17}[m
+[31m-JOBS=${3:-128}[m
+[31m-/root/nvidia_paralllel/ve/bin/python /root/nvidia_paralllel/python/worker.py --rows $ROWS --cols $COLS --qrc-layers 40 --jobs $JOBS[m
+[32m+[m[32mCOLS=${2:-28}[m
+[32m+[m[32mJOBS=${3:-100}[m
+[32m+[m
+[32m+[m[32mPY=/root/nvidia_paralllel/ve/bin/python[m
+[32m+[m[32mWORKER=/root/nvidia_paralllel/python/worker.py[m
+[32m+[m
+[32m+[m[32mecho "=== Run 1: all rows on CUDA-Q NVIDIA GPU ==="[m
+[32m+[m[32m$PY -u $WORKER --rows $ROWS --cols $COLS --qrc-layers 40 --jobs 1 --gpu-percent 100[m
+[32m+[m
+[32m+[m[32mecho ""[m
+[32m+[m[32mecho "=== Run 2: 50% on CUDA-Q, 50% on $JOBS CPU workers ==="[m
+[32m+[m[32m$PY -u $WORKER --rows $ROWS --cols $COLS --qrc-layers 40 --jobs $JOBS --gpu-percent 50[m

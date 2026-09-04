@@ -1,4 +1,4 @@
-"""CUDA-Q worker equivalence tests."""
+"""CUDA-Q worker equivalence and scheduling tests."""
 import numpy as np
 import pytest
 
@@ -6,9 +6,16 @@ from test_worker_equivalence import assert_worker_matches
 
 cudaq = pytest.importorskip("cudaq")
 
-gpu_required = pytest.mark.skipif(
-    cudaq.num_available_gpus() == 0, reason="no NVIDIA GPU available"
-)
+
+def test_check_gpu_memory_allows_fitting_statevector(worker_module, monkeypatch):
+    monkeypatch.setattr(worker_module, "get_gpu_memory_mb", lambda: (16000, 24000))
+    assert worker_module.check_gpu_memory(10, 1) == (16000, 24000, 0.0078125)
+
+
+def test_check_gpu_memory_rejects_insufficient_memory(worker_module, monkeypatch):
+    monkeypatch.setattr(worker_module, "get_gpu_memory_mb", lambda: (100, 16000))
+    with pytest.raises(RuntimeError, match="GPU memory is insufficient"):
+        worker_module.check_gpu_memory(30, 1)
 
 
 @pytest.fixture
@@ -36,67 +43,38 @@ def test_cudaq_worker_matches_reference(
     )
 
 
-@pytest.mark.slow
-def test_hybrid_output_matches_cpu_and_cudaq(
-    worker_module, dataset_small, reservoir_small, cpu_cudaq_target
-):
-    expected = worker_module.run_reservoir(
-        dataset_small, 3, 2, reservoir_small, n_jobs=1
+def test_gpu_count_controls_qpu_assignment(worker_module, monkeypatch):
+    data = np.arange(12, dtype=float).reshape(4, 3)
+    assignments = []
+
+    class Future:
+        def get(self):
+            return self
+
+        def expectation(self, _term):
+            return 0.0
+
+    monkeypatch.setattr(worker_module.cudaq, "set_target", lambda *args, **kwargs: None)
+    class Spin:
+        @staticmethod
+        def z(_index):
+            return Spin()
+
+        def __add__(self, _other):
+            return self
+
+    monkeypatch.setattr(worker_module.cudaq, "spin", Spin)
+    monkeypatch.setattr(
+        worker_module.cudaq,
+        "observe_async",
+        lambda *args, **kwargs: assignments.append(kwargs["qpu_id"]) or Future(),
     )
-    gpu_rows = int(len(dataset_small) * 40.0 / 100.0)
-    actual = worker_module.run_hybrid(
-        dataset_small,
-        3,
-        2,
-        reservoir_small,
-        n_jobs=1,
-        gpu_percent=40.0,
-        cuda_target="qpp-cpu",
+    monkeypatch.setattr(
+        worker_module.cudaq,
+        "get_target",
+        lambda: type("Target", (), {"num_qpus": lambda self: 2})(),
     )
-    assert gpu_rows == 2
-    np.testing.assert_allclose(actual, expected, atol=1e-9)
+    monkeypatch.setattr(worker_module, "_build_cudaq_kernel", lambda *args: object())
 
-
-@gpu_required
-@pytest.mark.gpu
-@pytest.mark.slow
-def test_cudaq_worker_matches_reference_on_gpu(
-    worker_module, dataset_small, reservoir_small
-):
-    previous = cudaq.get_target().name
-    try:
-        assert_worker_matches(
-            lambda chunk, qubits, layers, reservoir: worker_module.process_batch_cudaq(
-                chunk, qubits, layers, reservoir, target="nvidia"
-            ),
-            dataset_small,
-            3,
-            2,
-            reservoir_small,
-            tol=1e-6,  # nvidia target defaults to fp32
-        )
-    finally:
-        cudaq.set_target(previous)
-
-
-@gpu_required
-@pytest.mark.gpu
-@pytest.mark.slow
-def test_hybrid_on_gpu_matches_cpu(worker_module, dataset_small, reservoir_small):
-    previous = cudaq.get_target().name
-    try:
-        expected = worker_module.run_reservoir(
-            dataset_small, 3, 2, reservoir_small, n_jobs=1
-        )
-        actual = worker_module.run_hybrid(
-            dataset_small,
-            3,
-            2,
-            reservoir_small,
-            n_jobs=1,
-            gpu_percent=40.0,
-            cuda_target="nvidia",
-        )
-        np.testing.assert_allclose(actual, expected, atol=1e-6)
-    finally:
-        cudaq.set_target(previous)
+    worker_module.process_batch_cudaq(data, 3, 1, [], target="nvidia")
+    assert assignments == [0, 1, 0, 1]

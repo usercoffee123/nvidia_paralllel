@@ -1,36 +1,28 @@
 #!/usr/bin/env python3
-"""Quantum reservoir computing benchmark using Qiskit Aer + joblib."""
-import os
-
-# Pin all threading to 1 — must be set BEFORE importing numpy/qiskit so that
-# BLAS/OpenMP libraries pick up the values at load time.
-os.environ["OMP_NUM_THREADS"] = "1"
-os.environ["OPENBLAS_NUM_THREADS"] = "1"
-os.environ["MKL_NUM_THREADS"] = "1"
-os.environ["BLAS_NUM_THREADS"] = "1"
-os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
-os.environ["NUMEXPR_NUM_THREADS"] = "1"
-
+"""CUDA-Q quantum reservoir computing benchmark."""
 import argparse
-from concurrent.futures import ThreadPoolExecutor
 import math
+import os
+import subprocess
+import sys
 import time
 
-import numpy as np
-from joblib import Parallel, delayed
-from qiskit import QuantumCircuit
-from qiskit_aer import AerSimulator
+for _thread_variable in (
+    "OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+    "BLAS_NUM_THREADS", "VECLIB_MAXIMUM_THREADS", "NUMEXPR_NUM_THREADS",
+    "GOTO_NUM_THREADS", "NUMBA_NUM_THREADS", "TBB_NUM_THREADS",
+):
+    os.environ[_thread_variable] = "1"
+os.environ["OMP_DYNAMIC"] = "FALSE"
 
-try:
-    import cudaq
-except ImportError:  # CUDA-Q is optional for CPU-only installations.
-    cudaq = None
+import cudaq
+import numpy as np
 
 QRC_SEED = 42
 
 
 def build_reservoir_params(qubits: int, layers: int, seed: int):
-    """Generate deterministic pseudo-random rotation angles for reservoir layers."""
+    """Generate deterministic pseudo-random rotation angles."""
     params = []
     for layer in range(layers):
         row = []
@@ -43,164 +35,139 @@ def build_reservoir_params(qubits: int, layers: int, seed: int):
     return params
 
 
-def build_circuit(row_values, qubits: int, layers: int, reservoir):
-    """Construct a Qiskit QuantumCircuit for one row of data."""
-    qc = QuantumCircuit(qubits)
-
-    def feature_angle(index: int) -> float:
-        return math.pi * math.tanh(row_values[index % qubits])
-
-    # Feature encoding: RY + RZ on each qubit
-    for q in range(qubits):
-        theta = feature_angle(q)
-        qc.ry(theta, q)
-        qc.rz(0.5 * theta, q)
-
-    # Entangling layer: CZ ring
-    if qubits > 1:
-        for q in range(qubits):
-            qc.cz(q, (q + 1) % qubits)
-
-    # Reservoir layers
-    for layer in range(layers):
-        for q in range(qubits):
-            base_rx, base_rz = reservoir[layer][q]
-            injection = 0.35 * feature_angle(q + layer)
-            qc.rx(base_rx + injection, q)
-            qc.rz(base_rz - 0.25 * injection, q)
-        if qubits > 1:
-            for q in range(qubits):
-                qc.cz(q, (q + 1) % qubits)
-
-    return qc
-
-
 def compute_z_expectations(statevector, qubits: int):
-    """Compute exact per-qubit <Z> expectations from a statevector."""
+    """Compute exact per-qubit Z expectations from a statevector."""
     probabilities = np.abs(np.asarray(statevector)) ** 2
-    expectations = [0.0] * qubits
+    expectations = []
     for q in range(qubits):
         physical_qubit = qubits - 1 - q
-        expectation = 0.0
-        for basis, probability in enumerate(probabilities):
-            bit = (basis >> physical_qubit) & 1
-            expectation += probability * (1.0 - 2.0 * bit)
-        expectations[q] = float(expectation.real)
+        expectation = sum(
+            probability * (1.0 - 2.0 * ((basis >> physical_qubit) & 1))
+            for basis, probability in enumerate(probabilities)
+        )
+        expectations.append(float(expectation.real))
     return expectations
 
 
-def process_batch(chunk, qubits: int, layers: int, reservoir):
-    """Process one shard of rows and return their flattened Z expectations.
-
-    Runs inside a joblib worker process. It receives only its own slice of the
-    dataset and builds its own simulator; the fixed seed keeps results
-    deterministic regardless of how the rows are sharded.
-    """
-    simulator = AerSimulator(method="statevector", max_parallel_threads=1)
-    out = []
-    for row in chunk:
-        qc = build_circuit(row, qubits, layers, reservoir)
-        qc.save_statevector()
-        statevector = simulator.run(qc).result().get_statevector()
-        out.extend(compute_z_expectations(statevector, qubits))
-    return out
-
-
-def process_batch_cudaq(chunk, qubits: int, layers: int, reservoir, target="nvidia"):
-    """Process rows with CUDA-Q and return flattened exact Z expectations.
-
-    ``target`` is injectable so tests can use CUDA-Q's CPU statevector target;
-    production calls use the NVIDIA target by default.
-    """
-    if cudaq is None:
-        raise RuntimeError("CUDA-Q is required when --gpu-percent is nonzero")
-
-    cudaq.set_target(target)
-    out = []
-    for row in chunk:
-        kernel = cudaq.make_kernel()
-        qubit_register = kernel.qalloc(qubits)
-
-        def feature_angle(index: int) -> float:
-            return math.pi * math.tanh(row[index % qubits])
-
+def _build_cudaq_kernel(qubits: int, layers: int, reservoir):
+    kernel, *feature_angles = cudaq.make_kernel(*([float] * qubits))
+    qubit_register = kernel.qalloc(qubits)
+    for q in range(qubits):
+        theta = feature_angles[q]
+        kernel.ry(theta, qubit_register[q])
+        kernel.rz(0.5 * theta, qubit_register[q])
+    if qubits > 1:
         for q in range(qubits):
-            theta = feature_angle(q)
-            kernel.ry(theta, qubit_register[q])
-            kernel.rz(0.5 * theta, qubit_register[q])
-
+            kernel.cz(qubit_register[q], qubit_register[(q + 1) % qubits])
+    for layer in range(layers):
+        for q in range(qubits):
+            base_rx, base_rz = reservoir[layer][q]
+            injection = 0.35 * feature_angles[(q + layer) % qubits]
+            kernel.rx(base_rx + injection, qubit_register[q])
+            kernel.rz(base_rz - 0.25 * injection, qubit_register[q])
         if qubits > 1:
             for q in range(qubits):
                 kernel.cz(qubit_register[q], qubit_register[(q + 1) % qubits])
+    return kernel
 
-        for layer in range(layers):
-            for q in range(qubits):
-                base_rx, base_rz = reservoir[layer][q]
-                injection = 0.35 * feature_angle(q + layer)
-                kernel.rx(base_rx + injection, qubit_register[q])
-                kernel.rz(base_rz - 0.25 * injection, qubit_register[q])
-            if qubits > 1:
-                for q in range(qubits):
-                    kernel.cz(qubit_register[q], qubit_register[(q + 1) % qubits])
 
-        # Output index q maps to physical qubit qubits-1-q (see compute_z_expectations).
-        for q in range(qubits):
-            result = cudaq.observe(
-                kernel, cudaq.spin.z(qubits - 1 - q), shots_count=0
-            )
-            out.append(float(result.expectation()))
+def get_gpu_memory_mb(device=0):
+    """Return free and total GPU memory from nvidia-smi, or None if unavailable."""
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", f"--id={device}", "--query-gpu=memory.free,memory.total",
+             "--format=csv,noheader,nounits"],
+            check=True, capture_output=True, text=True,
+        )
+        free_mb, total_mb = (int(value.strip()) for value in result.stdout.split(","))
+        return free_mb, total_mb
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def check_gpu_memory(qubits: int, num_gpus: int):
+    """Check one statevector per GPU fits with 20% free-memory headroom."""
+    if num_gpus < 1:
+        return None
+    memory = get_gpu_memory_mb()
+    if memory is None:
+        return None
+    free_mb, total_mb = memory
+    required_mb = (2**qubits * 8) / (1024**2)
+    usable_mb = free_mb * 0.8 / num_gpus
+    if required_mb > usable_mb:
+        raise RuntimeError(
+            f"GPU memory is insufficient for {qubits} qubits: need about {required_mb:.0f} MiB per GPU, "
+            f"have {free_mb:.0f} MiB free of {total_mb:.0f} MiB ({num_gpus} GPU(s))"
+        )
+    return free_mb, total_mb, required_mb
+
+
+def process_batch_cudaq(chunk, qubits: int, layers: int, reservoir,
+                        target="nvidia", progress=False):
+    """Run a contiguous row shard through CUDA-Q in row order."""
+    if target == "nvidia":
+        cudaq.set_target("nvidia", option="mqpu")
+        num_gpus = cudaq.get_target().num_qpus()
+        if num_gpus == 0:
+            raise RuntimeError("CUDA-Q NVIDIA target is selected, but no GPU is available")
+    else:
+        cudaq.set_target(target)
+        num_gpus = 1
+
+    memory = check_gpu_memory(qubits, num_gpus) if target == "nvidia" else None
+    if progress:
+        memory_text = ""
+        if memory is not None:
+            free_mb, total_mb, required_mb = memory
+            memory_text = f"; {free_mb:.0f}/{total_mb:.0f} MiB free, ~{required_mb:.0f} MiB statevector"
+        print(f"CUDA-Q: {len(chunk)} rows across {num_gpus} GPU(s){memory_text}", flush=True)
+    if not len(chunk):
+        return []
+
+    kernel = _build_cudaq_kernel(qubits, layers, reservoir)
+    z_terms = [cudaq.spin.z(qubits - 1 - q) for q in range(qubits)]
+    composite = z_terms[0]
+    for term in z_terms[1:]:
+        composite = composite + term
+
+    angles = math.pi * np.tanh(np.asarray(chunk, dtype=float))
+    pending = []
+    out = []
+    next_row = 0
+    row_index = 0
+    queue_depth = max(1000, 8 * num_gpus)
+
+    def submit(row):
+        pending.append(cudaq.observe_async(
+            kernel, composite, *(float(value) for value in angles[row]),
+            qpu_id=row % num_gpus, shots_count=0,
+        ))
+
+    while next_row < min(queue_depth, len(angles)):
+        submit(next_row)
+        next_row += 1
+    while pending:
+        result = pending.pop(0).get()
+        out.extend(float(result.expectation(term)) for term in z_terms)
+        row_index += 1
+        if next_row < len(angles):
+            submit(next_row)
+            next_row += 1
+        if progress:
+            print(f"CUDA-Q: {row_index}/{len(angles)} rows", file=sys.stderr, flush=True)
     return out
 
 
-def run_reservoir(data, qubits: int, layers: int, reservoir, n_jobs: int):
-    """Shard rows across n_jobs joblib workers and return flattened Z expectations.
-
-    Each shard is pickled with only its own slice of the data so a worker never
-    holds the whole dataset. joblib preserves dispatch order, so concatenating
-    the returned batches yields row-major output.
-    """
-    rows = len(data)
-    if rows == 0:
-        return []
-    n_jobs = max(1, min(n_jobs, rows))
-    bounds = [(rows * i) // n_jobs for i in range(n_jobs + 1)]
-    batches = Parallel(n_jobs=n_jobs, backend="loky")(
-        delayed(process_batch)(data[bounds[i]:bounds[i + 1]], qubits, layers, reservoir)
-        for i in range(n_jobs)
-    )
-    return [value for batch in batches for value in batch]
+def process_batch(chunk, qubits: int, layers: int, reservoir):
+    """CUDA-Q CPU-target compatibility helper for unit tests."""
+    return process_batch_cudaq(chunk, qubits, layers, reservoir, target="qpp-cpu")
 
 
-def run_hybrid(
-    data,
-    qubits: int,
-    layers: int,
-    reservoir,
-    n_jobs: int,
-    gpu_percent: float,
-    cuda_target="nvidia",
-):
-    """Run a percentage of rows with CUDA-Q and the rest on CPU workers."""
-    if not 0.0 <= gpu_percent <= 100.0:
-        raise ValueError("gpu-percent must be between 0 and 100")
-    if gpu_percent == 0.0:
-        return run_reservoir(data, qubits, layers, reservoir, n_jobs)
-
-    rows = len(data)
-    gpu_rows = int(rows * gpu_percent / 100.0)
-    if gpu_rows == 0:
-        return run_reservoir(data, qubits, layers, reservoir, n_jobs)
-    cpu_data = data[gpu_rows:]
-    gpu_data = data[:gpu_rows]
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        cpu_future = executor.submit(
-            run_reservoir, cpu_data, qubits, layers, reservoir, n_jobs
-        )
-        gpu_result = process_batch_cudaq(
-            gpu_data, qubits, layers, reservoir, target=cuda_target
-        )
-        cpu_result = cpu_future.result()
-    return gpu_result + cpu_result
+def run_reservoir(data, qubits: int, layers: int, reservoir, target="nvidia"):
+    """Run all rows, assigning successive rows round-robin to available GPUs."""
+    return process_batch_cudaq(data, qubits, layers, reservoir,
+                               target=target, progress=target == "nvidia")
 
 
 def main() -> int:
@@ -208,32 +175,19 @@ def main() -> int:
     parser.add_argument("--rows", type=int, default=3000)
     parser.add_argument("--cols", type=int, default=6)
     parser.add_argument("--qrc-layers", type=int, default=2)
-    parser.add_argument("--jobs", type=int, nargs="+", default=[1, 2, 4, 8, 16])
-    parser.add_argument("--gpu-percent", type=float, default=0.0)
     args = parser.parse_args()
-
     if args.rows < 1 or args.cols < 1 or args.qrc_layers < 1:
         print("rows, cols and qrc-layers must be > 0")
-        return 1
-    if not 0.0 <= args.gpu_percent <= 100.0:
-        print("gpu-percent must be between 0 and 100")
         return 1
 
     qubits = args.cols
     rng = np.random.default_rng(QRC_SEED)
     data = rng.uniform(-1.0, 1.0, size=(args.rows, qubits))
     reservoir = build_reservoir_params(qubits, args.qrc_layers, QRC_SEED)
-
     print(f"Dataset: {args.rows}x{qubits}, qrc-layers={args.qrc_layers}")
-    print("\nRuntime by joblib job count:")
-    for n_jobs in args.jobs:
-        n = max(1, min(n_jobs, args.rows))
-        t0 = time.perf_counter()
-        run_hybrid(
-            data, qubits, args.qrc_layers, reservoir, n, args.gpu_percent
-        )
-        print(f"{n_jobs}\t{time.perf_counter() - t0:.4f}")
-
+    t0 = time.perf_counter()
+    run_reservoir(data, qubits, args.qrc_layers, reservoir)
+    print(f"CUDA-Q runtime: {time.perf_counter() - t0:.4f}s")
     return 0
 
 

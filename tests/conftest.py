@@ -3,7 +3,7 @@
 The most important piece here is :func:`reference_z_expectations`, an independent
 statevector implementation of the same circuit that ``python/worker.py`` builds.
 It is used as ground truth so that *any* worker implementation - the current
-Qiskit Aer CPU worker or a future CUDA-Q / GPU worker - can be validated against
+CUDA-Q workers can be validated against
 the exact same analytic result. See ``tests/test_worker_equivalence.py``.
 """
 from __future__ import annotations

@@ -35,30 +35,17 @@ def test_main_returns_error_for_bad_layers(worker_module, monkeypatch):
     assert worker_module.main() == 1
 
 
-def test_main_returns_error_for_bad_gpu_percent(worker_module, monkeypatch):
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        ["worker.py", "--rows", "10", "--cols", "3", "--gpu-percent", "101"],
-    )
-    assert worker_module.main() == 1
-
-
 @pytest.mark.slow
 def test_cli_smoke_run():
-    result = _run(["--rows", "4", "--cols", "3", "--jobs", "1", "2"])
+    result = _run(["--rows", "4", "--cols", "3"])
     assert result.returncode == 0, result.stderr
     assert "Dataset: 4x3" in result.stdout
-    assert "Runtime by joblib job count:" in result.stdout
+    assert "CUDA-Q runtime:" in result.stdout
 
 
 @pytest.mark.slow
 def test_cli_output_lines_match_jobs():
-    result = _run(["--rows", "3", "--cols", "2", "--jobs", "1", "2", "4"])
+    result = _run(["--rows", "3", "--cols", "2"])
     assert result.returncode == 0, result.stderr
-    lines = [ln for ln in result.stdout.splitlines() if "\t" in ln]
-    assert len(lines) == 3
-    for ln in lines:
-        job, seconds = ln.split("\t")
-        int(job)
-        float(seconds)
+    runtime = [ln for ln in result.stdout.splitlines() if ln.startswith("CUDA-Q runtime:")]
+    assert len(runtime) == 1
