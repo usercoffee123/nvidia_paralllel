@@ -35,6 +35,15 @@ def test_main_returns_error_for_bad_layers(worker_module, monkeypatch):
     assert worker_module.main() == 1
 
 
+def test_main_returns_error_for_bad_gpu_percent(worker_module, monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["worker.py", "--rows", "10", "--cols", "3", "--gpu-percent", "101"],
+    )
+    assert worker_module.main() == 1
+
+
 @pytest.mark.slow
 def test_cli_smoke_run():
     result = _run(["--rows", "4", "--cols", "3", "--jobs", "1", "2"])

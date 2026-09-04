@@ -21,6 +21,7 @@ Dependencies (see [requirements.txt](requirements.txt)):
 - `qiskit-aer>=0.14`
 - `numpy>=1.24`
 - `joblib>=1.3`
+- `cudaq>=0.15`
 
 ## Run
 
@@ -34,6 +35,8 @@ Command-line options:
 - `--cols <n>`: columns per row, which is also the number of qubits, default `6`.
 - `--qrc-layers <n>`: number of reservoir layers in the circuit, default `2`.
 - `--jobs <n> [<n> ...]`: one or more joblib worker counts to sweep, default `1 2 4 8 16`.
+- `--gpu-percent <p>`: percentage of rows processed by CUDA-Q on the NVIDIA target,
+  from `0` to `100`, default `0`.
 
 Each requested job count is clamped to `min(jobs, rows)`.
 
@@ -51,6 +54,9 @@ Each requested job count is clamped to `min(jobs, rows)`.
   order is preserved so concatenating the shard outputs yields row-major results.
 - The program prints the dataset shape and the wall-clock runtime for each
   requested job count.
+- With a nonzero `--gpu-percent`, the leading percentage of rows is sent to one
+  CUDA-Q worker while the remaining rows are split evenly across the requested
+  CPU workers. Results remain in their original row order.
 
 ## Output
 
@@ -72,7 +78,8 @@ Each row under the header is `<job count>\t<seconds>`.
 - Input generation is seeded (`QRC_SEED = 42`).
 - BLAS/OpenMP thread counts are pinned to `1` before importing NumPy/Qiskit to
   avoid oversubscription when multiple joblib workers run in parallel.
-- The simulator uses explicit seeding and fixed shots for reproducible output.
+- Both workers compute exact expectations without measurement-shot sampling. The
+  CPU path uses Aer's statevector simulator; CUDA-Q uses zero-shot observation.
 
 ## Tests
 
@@ -89,6 +96,9 @@ Qiskit simulations):
 ```bash
 pytest -m "not slow"
 ```
+
+CUDA-Q equivalence tests use the `qpp-cpu` target and do not require an NVIDIA GPU.
+The CLI's nonzero `--gpu-percent` path requires a working CUDA-Q NVIDIA target.
 
 The suite covers:
 

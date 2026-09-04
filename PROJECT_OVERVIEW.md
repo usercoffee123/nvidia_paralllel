@@ -34,10 +34,14 @@ The entire implementation lives in a single Python file: `python/worker.py`.
   * Builds a Qiskit `QuantumCircuit` per row and runs it on an `AerSimulator`
     (`statevector` method, seeded, single-threaded).
   * Returns the flattened Z expectations for its rows.
+* **Hybrid worker** (`run_hybrid` in `python/worker.py`)
+  * Sends the requested leading percentage of rows to CUDA-Q's NVIDIA target.
+  * Splits the remaining rows across the requested CPU worker count and restores
+    the original row-major order when combining results.
 
 * **Determinism**
-  * Reservoir angles and simulator output are seeded, so results are identical
-    regardless of how many workers the rows are sharded across.
+  * Reservoir angles and input data are seeded. Both backends use exact,
+    noiseless expectations, so results are identical regardless of sharding.
 
 ---
 
@@ -118,6 +122,7 @@ python python/worker.py --rows <NUM_ROWS> --cols <NUM_COLS>
 * `--cols` – number of columns / qubits, default `6`.
 * `--qrc-layers` – number of reservoir layers, default `2`.
 * `--jobs` – one or more joblib worker counts to sweep, default `1 2 4 8 16`.
+* `--gpu-percent` – percentage of leading rows processed by CUDA-Q, default `0`.
 
 ---
 
