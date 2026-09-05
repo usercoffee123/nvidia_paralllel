@@ -71,10 +71,10 @@ def test_gpu_count_controls_qpu_assignment(worker_module, monkeypatch):
     )
     monkeypatch.setattr(
         worker_module.cudaq,
-        "get_target",
-        lambda: type("Target", (), {"num_qpus": lambda self: 2})(),
+        "num_available_gpus",
+        lambda: 2,
     )
     monkeypatch.setattr(worker_module, "_build_cudaq_kernel", lambda *args: object())
 
     worker_module.process_batch_cudaq(data, 3, 1, [], target="nvidia")
-    assert assignments == [0, 1, 0, 1]
+    assert assignments == [0, 0, 1, 1]

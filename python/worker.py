@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """CUDA-Q quantum reservoir computing benchmark."""
 import argparse
+from collections import deque
 import math
 import os
 import subprocess
@@ -19,6 +20,9 @@ import cudaq
 import numpy as np
 
 QRC_SEED = 42
+NVIDIA_TARGET = "nvidia"
+MIN_QUEUE_DEPTH = 2000
+QUEUE_DEPTH_PER_GPU = 32
 
 
 def build_reservoir_params(qubits: int, layers: int, seed: int):
@@ -85,6 +89,24 @@ def get_gpu_memory_mb(device=0):
         return None
 
 
+def _configure_target(target: str) -> int:
+    """Select a CUDA-Q target and return its available QPU count."""
+    if target == NVIDIA_TARGET:
+        cudaq.set_target(NVIDIA_TARGET, option="mqpu")
+        num_gpus = cudaq.num_available_gpus()
+        if num_gpus == 0:
+            raise RuntimeError("CUDA-Q NVIDIA target is selected, but no GPU is available")
+        return num_gpus
+
+    cudaq.set_target(target)
+    return 1
+
+
+def _qpu_for_row(row_index: int, row_count: int, num_gpus: int) -> int:
+    """Assign contiguous, balanced row batches to the available QPUs."""
+    return min(row_index * num_gpus // row_count, num_gpus - 1)
+
+
 def check_gpu_memory(qubits: int, num_gpus: int):
     """Check one statevector per GPU fits with 20% free-memory headroom."""
     if num_gpus < 1:
@@ -105,17 +127,10 @@ def check_gpu_memory(qubits: int, num_gpus: int):
 
 def process_batch_cudaq(chunk, qubits: int, layers: int, reservoir,
                         target="nvidia", progress=False):
-    """Run a contiguous row shard through CUDA-Q in row order."""
-    if target == "nvidia":
-        cudaq.set_target("nvidia", option="mqpu")
-        num_gpus = cudaq.get_target().num_qpus()
-        if num_gpus == 0:
-            raise RuntimeError("CUDA-Q NVIDIA target is selected, but no GPU is available")
-    else:
-        cudaq.set_target(target)
-        num_gpus = 1
+    """Run a row batch through CUDA-Q and return flat expectation values."""
+    num_gpus = _configure_target(target)
 
-    memory = check_gpu_memory(qubits, num_gpus) if target == "nvidia" else None
+    memory = check_gpu_memory(qubits, num_gpus) if target == NVIDIA_TARGET else None
     if progress:
         memory_text = ""
         if memory is not None:
@@ -132,30 +147,31 @@ def process_batch_cudaq(chunk, qubits: int, layers: int, reservoir,
         composite = composite + term
 
     angles = math.pi * np.tanh(np.asarray(chunk, dtype=float))
-    pending = []
+    pending = deque()
     out = []
     next_row = 0
     row_index = 0
-    queue_depth = max(1000, 8 * num_gpus)
+    queue_depth = max(MIN_QUEUE_DEPTH, QUEUE_DEPTH_PER_GPU * num_gpus)
 
-    def submit(row):
+    def submit(row_index):
+        qpu_id = _qpu_for_row(row_index, len(angles), num_gpus)
         pending.append(cudaq.observe_async(
-            kernel, composite, *(float(value) for value in angles[row]),
-            qpu_id=row % num_gpus, shots_count=0,
+            kernel, composite, *(float(value) for value in angles[row_index]),
+            qpu_id=qpu_id, shots_count=0,
         ))
 
     while next_row < min(queue_depth, len(angles)):
         submit(next_row)
         next_row += 1
     while pending:
-        result = pending.pop(0).get()
+        result = pending.popleft().get()
         out.extend(float(result.expectation(term)) for term in z_terms)
         row_index += 1
+        if progress:
+            print(f"CUDA-Q: {row_index}/{len(angles)} rows completed", file=sys.stderr, flush=True)
         if next_row < len(angles):
             submit(next_row)
             next_row += 1
-        if progress:
-            print(f"CUDA-Q: {row_index}/{len(angles)} rows", file=sys.stderr, flush=True)
     return out
 
 
