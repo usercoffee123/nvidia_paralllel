@@ -175,8 +175,6 @@ def main() -> int:
     parser.add_argument("--rows", type=int, default=3000)
     parser.add_argument("--cols", type=int, default=6)
     parser.add_argument("--qrc-layers", type=int, default=2)
-    parser.add_argument("--output", type=str, default="results.csv",
-                        help="CSV file to write the resulting row outputs to")
     args = parser.parse_args()
     if args.rows < 1 or args.cols < 1 or args.qrc_layers < 1:
         print("rows, cols and qrc-layers must be > 0")
@@ -188,13 +186,8 @@ def main() -> int:
     reservoir = build_reservoir_params(qubits, args.qrc_layers, QRC_SEED)
     print(f"Dataset: {args.rows}x{qubits}, qrc-layers={args.qrc_layers}")
     t0 = time.perf_counter()
-    results = run_reservoir(data, qubits, args.qrc_layers, reservoir)
-    result_array = np.asarray(results, dtype=float)
-    if result_array.ndim == 1:
-        result_array = result_array.reshape(-1, qubits)
-    np.savetxt(args.output, result_array, delimiter=",", fmt="%.10f")
+    run_reservoir(data, qubits, args.qrc_layers, reservoir)
     print(f"CUDA-Q runtime: {time.perf_counter() - t0:.4f}s")
-    print(f"Results written to {args.output}")
     return 0
 
 
