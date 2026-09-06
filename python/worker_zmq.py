@@ -11,6 +11,7 @@ import sys
 def _parse_args_early():
     """Parse args to get gpu_id, then set env."""
     parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--worker-id", type=int, default=0)
     parser.add_argument("--gpu-id", type=int, required=True)
     parser.add_argument("--router-url", type=str, required=True)
     parser.add_argument("--qubits", type=int, default=28)
@@ -42,7 +43,7 @@ from worker import (
 )
 
 
-def worker_main(gpu_id: int, router_url: str, qubits: int, layers: int):
+def worker_main(worker_id: int, gpu_id: int, router_url: str, qubits: int, layers: int):
     """
     Single-GPU worker process using DEALER socket.
     
@@ -63,7 +64,7 @@ def worker_main(gpu_id: int, router_url: str, qubits: int, layers: int):
     socket = context.socket(zmq.DEALER)
     socket.setsockopt(zmq.RCVTIMEO, 600000)  # 10 min safety timeout; normal exit is via kill message
     socket.setsockopt(zmq.LINGER, 0)  # don't block on close with unsent messages
-    socket.setsockopt_string(zmq.IDENTITY, f"worker-gpu{gpu_id}")
+    socket.setsockopt_string(zmq.IDENTITY, f"worker-{worker_id}")
     socket.connect(router_url)
     
     print(f"[GPU {gpu_id}] Connected to coordinator at {router_url}", flush=True)
@@ -129,10 +130,11 @@ def worker_main(gpu_id: int, router_url: str, qubits: int, layers: int):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
+    parser.add_argument("--worker-id", type=int, default=0)
     parser.add_argument("--gpu-id", type=int, required=True)
     parser.add_argument("--router-url", type=str, required=True)
     parser.add_argument("--qubits", type=int, default=28)
     parser.add_argument("--layers", type=int, default=8)
     args = parser.parse_args()
     
-    worker_main(args.gpu_id, args.router_url, args.qubits, args.layers)
+    worker_main(args.worker_id, args.gpu_id, args.router_url, args.qubits, args.layers)
