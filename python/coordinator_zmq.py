@@ -138,6 +138,8 @@ if __name__ == "__main__":
     parser.add_argument("--qubits", type=int, default=28)
     parser.add_argument("--layers", type=int, default=8)
     parser.add_argument("--gpus", type=int, default=8)
+    parser.add_argument("--output", type=str, default="results.csv",
+                        help="Output CSV file path")
     args = parser.parse_args()
     
     # Dummy data for testing
@@ -145,3 +147,9 @@ if __name__ == "__main__":
     
     results = run_distributed(test_rows, args.qubits, args.layers, args.gpus)
     print(f"Got {len(results)} results", flush=True)
+    
+    # Write results to CSV: one row per input row, one column per qubit expectation
+    results_matrix = np.asarray(results, dtype=np.float64).reshape(-1, args.qubits)
+    header = ",".join(f"z_q{q}" for q in range(args.qubits))
+    np.savetxt(args.output, results_matrix, delimiter=",", header=header, comments="")
+    print(f"Wrote {results_matrix.shape[0]} rows x {results_matrix.shape[1]} columns to {args.output}", flush=True)
