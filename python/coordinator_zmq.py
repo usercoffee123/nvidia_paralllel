@@ -35,6 +35,8 @@ def run_distributed(rows, qubits: int, layers: int, num_gpus: int = None):
     
     # ROUTER socket: receives connections from DEALER workers
     router_socket = context.socket(zmq.ROUTER)
+    router_socket.setsockopt(zmq.LINGER, 0)  # never block on close
+    router_socket.setsockopt(zmq.RCVTIMEO, 5000)  # poll in 5s slices so we can check worker liveness
     router_socket.bind("tcp://127.0.0.1:0")
     router_url = router_socket.getsockopt_string(zmq.LAST_ENDPOINT)
     
@@ -62,8 +64,32 @@ def run_distributed(rows, qubits: int, layers: int, num_gpus: int = None):
         worker_procs.append((gpu_id, proc))
         print(f"Spawned worker for GPU {gpu_id} (PID {proc.pid})", flush=True)
     
-    # Give workers time to connect to ROUTER
-    time.sleep(2.0)
+    def fail_dead_workers():
+        """Raise if any worker process exited; their messages would never arrive."""
+        for g, p in worker_procs:
+            if p.poll() is not None:
+                out = p.stdout.read() if p.stdout else ""
+                raise RuntimeError(
+                    f"Worker GPU {g} died (exit {p.returncode}). Output:\n{out}")
+    
+    # Ready handshake: ROUTER silently drops messages to identities that have not
+    # connected yet (slow-joiner race: cudaq import can take many seconds), so
+    # never send work until every worker has announced itself.
+    print("Waiting for ready handshake from all workers...", flush=True)
+    ready = set()
+    deadline = time.monotonic() + 120
+    while len(ready) < num_gpus:
+        fail_dead_workers()
+        if time.monotonic() > deadline:
+            raise RuntimeError(f"Only {len(ready)}/{num_gpus} workers ready after 120s: {ready}")
+        try:
+            frames = router_socket.recv_multipart()
+        except zmq.error.Again:
+            continue
+        meta = json.loads(frames[-1].decode())
+        if meta.get("status") == "ready":
+            ready.add(frames[0].decode())
+            print(f"Ready {len(ready)}/{num_gpus}: {frames[0].decode()}", flush=True)
     
     # Divide rows into chunks (one per GPU)
     rows = np.asarray(rows, dtype=np.float64)
@@ -91,15 +117,21 @@ def run_distributed(rows, qubits: int, layers: int, num_gpus: int = None):
     # Collect results from workers via ROUTER
     print("Collecting results...", flush=True)
     results_by_chunk = [None] * num_gpus
+    collected = 0
     
-    for _ in range(num_gpus):
-        # ROUTER returns [identity, empty_delimiter, meta_json, results_bytes]
-        worker_id, _, meta_data, results_data = router_socket.recv_multipart()
+    while collected < num_gpus:
+        fail_dead_workers()
+        try:
+            # ROUTER returns [identity, empty_delimiter, meta_json, results_bytes]
+            worker_id, _, meta_data, results_data = router_socket.recv_multipart()
+        except zmq.error.Again:
+            continue
         meta = json.loads(meta_data.decode())
         task_id = meta["task_id"]
         results = np.frombuffer(results_data, dtype=np.float64)
         print(f"Got results from task {task_id}: {len(results)} values", flush=True)
         results_by_chunk[task_id] = results
+        collected += 1
         # Poison pill: tell this worker to exit now instead of waiting for recv timeout
         router_socket.send_multipart([worker_id, b"", b'{"command": "kill"}'])
     

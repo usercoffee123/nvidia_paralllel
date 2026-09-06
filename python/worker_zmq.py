@@ -73,6 +73,11 @@ def worker_main(gpu_id: int, router_url: str, qubits: int, layers: int):
     target = cudaq.get_target()
     print(f"[GPU {gpu_id}] Target: {target.name}, QPUs: {target.num_qpus()}", flush=True)
     
+    # Announce readiness: coordinator must not send work before we are connected,
+    # or ROUTER drops it silently (slow-joiner race)
+    socket.send_multipart([b"", json.dumps({"status": "ready", "gpu_id": gpu_id}).encode()])
+    print(f"[GPU {gpu_id}] Sent ready handshake", flush=True)
+    
     tasks_completed = 0
     
     # Process work until no more messages (timeout after 60s of inactivity)

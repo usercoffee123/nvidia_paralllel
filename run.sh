@@ -1,9 +1,9 @@
 #!/bin/bash
 set -euo pipefail
 
-ROWS=${1:-4}
-QUBITS=${2:-10}
-LAYERS=${3:-4}
+ROWS=${1:-40}
+QUBITS=${2:-24}
+LAYERS=${3:-10}
 OUTPUT=${4:-results.csv}
 GPU_LIST=${CUDA_VISIBLE_DEVICES:-0}
 PY=/root/nvidia_paralllel/ve/bin/python
