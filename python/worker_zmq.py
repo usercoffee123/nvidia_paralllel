@@ -61,7 +61,8 @@ def worker_main(gpu_id: int, router_url: str, qubits: int, layers: int):
     
     # DEALER: request-reply with coordinator (each worker gets own message stream)
     socket = context.socket(zmq.DEALER)
-    socket.setsockopt(zmq.RCVTIMEO, 60000)  # 60 second timeout on recv
+    socket.setsockopt(zmq.RCVTIMEO, 600000)  # 10 min safety timeout; normal exit is via kill message
+    socket.setsockopt(zmq.LINGER, 0)  # don't block on close with unsent messages
     socket.setsockopt_string(zmq.IDENTITY, f"worker-gpu{gpu_id}")
     socket.connect(router_url)
     
@@ -78,12 +79,18 @@ def worker_main(gpu_id: int, router_url: str, qubits: int, layers: int):
     while True:
         try:
             # Receive work from coordinator
-            # DEALER returns [empty_delimiter, message_data]
-            _, message_data = socket.recv_multipart()
-            message = json.loads(message_data.decode())
+            # DEALER returns [empty_delimiter, meta_json] or [empty_delimiter, meta_json, rows_bytes]
+            frames = socket.recv_multipart()
+            meta = json.loads(frames[1].decode())
             
-            rows = np.array(message["rows"], dtype=np.float64)
-            task_id = message.get("task_id", 0)
+            # Poison pill from coordinator: exit immediately
+            if meta.get("command") == "kill":
+                print(f"[GPU {gpu_id}] Received kill message, exiting", flush=True)
+                break
+            
+            rows = np.frombuffer(frames[2], dtype=np.float64).reshape(
+                meta["num_rows"], meta["num_cols"])
+            task_id = meta.get("task_id", 0)
             
             print(f"[GPU {gpu_id}] Processing task {task_id} with {len(rows)} rows", flush=True)
             
@@ -93,14 +100,10 @@ def worker_main(gpu_id: int, router_url: str, qubits: int, layers: int):
                 target="nvidia", progress=False
             )
             
-            # Send results back via DEALER
-            response = {
-                "task_id": task_id,
-                "gpu_id": gpu_id,
-                "results": results,  # List of floats
-            }
-            
-            socket.send_multipart([b"", json.dumps(response).encode()])
+            # Send results back via DEALER: JSON meta + binary float64 payload
+            meta_out = {"task_id": task_id, "gpu_id": gpu_id}
+            results_bytes = np.asarray(results, dtype=np.float64).tobytes()
+            socket.send_multipart([b"", json.dumps(meta_out).encode(), results_bytes])
             tasks_completed += 1
             print(f"[GPU {gpu_id}] Task {task_id} done - sent {len(results)} results", flush=True)
             

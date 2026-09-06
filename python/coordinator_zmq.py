@@ -79,27 +79,29 @@ def run_distributed(rows, qubits: int, layers: int, num_gpus: int = None):
     
     # Send work to each worker via ROUTER
     # ROUTER addresses workers by identity: b"worker-gpu0", b"worker-gpu1", etc.
+    # Payload is binary float64 (JSON for 100k+ rows takes minutes to encode/parse)
     print("Sending work to all workers...", flush=True)
     for i, gpu_id in enumerate(visible_gpus):
         worker_id = f"worker-gpu{gpu_id}".encode()
-        message = {
-            "task_id": i,
-            "rows": chunks[i],
-        }
-        router_socket.send_multipart([worker_id, b"", json.dumps(message).encode()])
+        chunk = np.ascontiguousarray(chunks[i], dtype=np.float64)
+        meta = {"task_id": i, "num_rows": chunk.shape[0], "num_cols": qubits}
+        router_socket.send_multipart(
+            [worker_id, b"", json.dumps(meta).encode(), chunk.tobytes()])
     
     # Collect results from workers via ROUTER
     print("Collecting results...", flush=True)
     results_by_chunk = [None] * num_gpus
     
     for _ in range(num_gpus):
-        # ROUTER returns [identity, empty_delimiter, response_data]
-        worker_id, _, response_data = router_socket.recv_multipart()
-        response = json.loads(response_data.decode())
-        task_id = response["task_id"]
-        results = response["results"]
+        # ROUTER returns [identity, empty_delimiter, meta_json, results_bytes]
+        worker_id, _, meta_data, results_data = router_socket.recv_multipart()
+        meta = json.loads(meta_data.decode())
+        task_id = meta["task_id"]
+        results = np.frombuffer(results_data, dtype=np.float64)
         print(f"Got results from task {task_id}: {len(results)} values", flush=True)
         results_by_chunk[task_id] = results
+        # Poison pill: tell this worker to exit now instead of waiting for recv timeout
+        router_socket.send_multipart([worker_id, b"", b'{"command": "kill"}'])
     
     # Clean up sockets
     router_socket.close()
@@ -109,7 +111,7 @@ def run_distributed(rows, qubits: int, layers: int, num_gpus: int = None):
     print("Waiting for workers to finish...", flush=True)
     for gpu_id, proc in worker_procs:
         try:
-            proc.wait(timeout=30)
+            proc.wait(timeout=10)
             stdout_data = proc.stdout.read() if proc.stdout else ""
             for line in stdout_data.split("\n"):
                 if line.strip():
@@ -125,8 +127,8 @@ def run_distributed(rows, qubits: int, layers: int, num_gpus: int = None):
     # Flatten results in order
     flat_results = []
     for chunk_results in results_by_chunk:
-        if chunk_results:
-            flat_results.extend(chunk_results)
+        if chunk_results is not None and len(chunk_results):
+            flat_results.extend(chunk_results.tolist())
     
     print(f"\nAll workers done. Returned {len(flat_results)} results.", flush=True)
     return flat_results
