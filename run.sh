@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Usage: ./run.sh [rows] [qubits] [layers] [devices] [output.csv]
 #   devices: comma-separated GPU ids, e.g. 0,1,2,3 (one worker per device)
-ROWS=${1:-40}
+ROWS=${1:-500}
 QUBITS=${2:-21}
 LAYERS=${3:-40}
 DEVICES=${4:-${CUDA_VISIBLE_DEVICES:-0}}
